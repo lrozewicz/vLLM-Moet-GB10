@@ -14,6 +14,7 @@ vllm/compilation/cuda_graph.py
 vllm/config/speculative.py
 vllm/config/vllm.py
 vllm/envs.py
+vllm/model_executor/layers/attention/attention.py
 vllm/model_executor/layers/attention/mla_attention.py
 vllm/model_executor/layers/quantization/fp8.py
 vllm/model_executor/layers/quantization/modelopt.py

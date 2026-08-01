@@ -2272,7 +2272,7 @@ index d51a2dd..92f7c18 100644
                  return UnquantizedLinearMethod()
              return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 1b2a8a7..e025de9 100644
+index 1b2a8a7..c699dfd 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
 @@ -491,7 +491,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -2285,7 +2285,7 @@ index 1b2a8a7..e025de9 100644
  
      @property
      def skip_forward_padding(self) -> bool:
-@@ -617,6 +618,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -617,6 +618,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
              layer.register_parameter("w2_bias", w2_bias)
              set_weight_attrs(w2_bias, extra_weight_attrs)
@@ -2295,6 +2295,17 @@ index 1b2a8a7..e025de9 100644
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
 +            if moe_w2_cubit.plan_pack_skip(layer):
++                return
++            # STREAM-BUILD for the mxfp4 path (DeepSeek-V4-Flash): requant
++            # each layer the moment its last expert tensor lands instead of
++            # staging the whole checkpoint (~150 GB) in host RAM first. On
++            # unified memory (GB10) the classic staging cannot fit at all.
++            # quant_method goes on the ORIGINAL params: arm_stream_build
++            # keeps those objects (the classic path below creates new
++            # Parameters and re-sets it — idempotent).
++            for _sn in ("w13_weight_scale", "w2_weight_scale"):
++                getattr(layer, _sn).quant_method = "block"
++            if moe_w2_cubit.arm_stream_build(layer):
 +                return
 +            for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
 +                          "w2_weight_scale"):
@@ -2309,7 +2320,7 @@ index 1b2a8a7..e025de9 100644
  
      def _setup_kernel(
          self,
-@@ -722,6 +740,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -722,6 +751,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
  
      def process_weights_after_loading(self, layer):
@@ -2318,14 +2329,17 @@ index 1b2a8a7..e025de9 100644
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
 +            key = getattr(
 +                layer, "_moe_w2_create_key", len(moe_w2_cubit._LAYERS))
-+            moe_w2_cubit.build_layer_planes(layer, key)
++            # Do not rebuild a layer the stream-build already requantized
++            # during load (same guard modelopt.py has).
++            if not getattr(layer, "_moe_w2_stream_built", False):
++                moe_w2_cubit.build_layer_planes(layer, key)
 +            layer._moe_w2_key = key
 +            return
 +
          w13 = layer.w13_weight
          w2 = layer.w2_weight
          w13_scale = layer.w13_weight_scale
-@@ -779,6 +806,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -779,6 +820,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -2769,10 +2783,10 @@ index 0000000..d26ce2c
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..faff80e
+index 0000000..b29f435
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2715 @@
+@@ -0,0 +1,2733 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -3109,14 +3123,16 @@ index 0000000..faff80e
 +    try:
 +        torch.cuda.init()
 +        torch.zeros(1, device="cuda")
-+        # Hand-written SASS = sm_120 ONLY, and the cubins carry no PTX to
-+        # JIT elsewhere. Refuse EARLY with a clear message instead of the
-+        # late shape-assert at weight load (review finding 2.6): SM121
-+        # (GB10/DGX Spark), SM100 and SM90 cannot run these kernels.
++        # Hand-written SASS for the sm_12x consumer-Blackwell family, no PTX
++        # to JIT elsewhere. Family compatibility verified on sm_121
++        # (GB10 / DGX Spark class): all 80 cubins load via cuModuleLoadData
++        # and compute bit-identically to sm_120 (test_split_equiv
++        # max_abs_diff=0). Refuse EARLY on other families (SM100/SM90)
++        # instead of the late shape-assert at weight load.
 +        cap = torch.cuda.get_device_capability()
-+        if cap != (12, 0):
++        if cap[0] != 12:
 +            raise RuntimeError(
-+                f"moe_w2 cubins are sm_120-only (hand-written SASS, no "
++                f"moe_w2 cubins are sm_12x-only (hand-written SASS, no "
 +                f"PTX); this device reports sm_{cap[0]}{cap[1]}. Unset "
 +                "VLLM_MOE_W2 on this hardware.")
 +        cu = _driver()
@@ -3497,7 +3513,11 @@ index 0000000..faff80e
 +        pend[self._pname] -= 1
 +        if all(v == 0 for v in pend.values()):
 +            key = self._layer._moe_w2_create_key
-+            build_layer_planes_nvfp4(self._layer, key)
++            # Dispatch to the builder arm_stream_build recorded for this
++            # layer's checkpoint format (nvfp4 vs mxfp4) — running an mxfp4
++            # layer through the modelopt builder is silent plane corruption.
++            getattr(self._layer, "_moe_w2_stream_builder",
++                    build_layer_planes_nvfp4)(self._layer, key)
 +            # Drop the staging storage IN PLACE on the ORIGINAL Parameter
 +            # objects. _finish_layer replaced the layer's attributes with
 +            # stub Parameters, but load_weights' params_dict (built once,
@@ -3539,10 +3559,22 @@ index 0000000..faff80e
 +        E = layer.w13_weight.shape[0]
 +    except Exception:  # noqa: BLE001 - unexpected layout: staged path
 +        return False
-+    expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
-+                "w13_weight_scale_2": 2 * E,
-+                "w2_weight": E, "w2_weight_scale": E,
-+                "w2_weight_scale_2": E}
++    # Format-aware expected counts: modelopt NVFP4 carries per-tensor
++    # scale_2 params, the mxfp4 path (FP4 checkpoints, DeepSeek-V4-Flash)
++    # does NOT. Demanding scale_2 there made this function return False and
++    # silently fall back to full-checkpoint staging — fatal on unified
++    # memory (GB10: the 155 GiB DS4 checkpoint cannot stage into 121.6 GiB).
++    if all(getattr(layer, _n, None) is not None
++           for _n in ("w13_weight_scale_2", "w2_weight_scale_2")):
++        expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
++                    "w13_weight_scale_2": 2 * E,
++                    "w2_weight": E, "w2_weight_scale": E,
++                    "w2_weight_scale_2": E}
++        layer._moe_w2_stream_builder = build_layer_planes_nvfp4
++    else:
++        expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
++                    "w2_weight": E, "w2_weight_scale": E}
++        layer._moe_w2_stream_builder = build_layer_planes
 +    big = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
 +    wrappers = {}
 +    for pname in expected:
@@ -11296,7 +11328,7 @@ index 0000000..be4a87b
 +            return f"model.{rest}"
 +        return f"model.layers.{stage}.{rest}"
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index aa60ad3..06307f6 100644
+index aa60ad3..45367e9 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -46,7 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -11366,7 +11398,7 @@ index aa60ad3..06307f6 100644
              hidden_states, residual, post_mix, res_mix = layer(
                  hidden_states,
                  positions,
-@@ -1067,17 +1091,33 @@ class DeepseekV4Model(nn.Module):
+@@ -1067,17 +1091,35 @@ class DeepseekV4Model(nn.Module):
                  res_mix,
                  residual,
              )
@@ -11375,11 +11407,13 @@ index aa60ad3..06307f6 100644
 +                aux_recon = mhc_post_tilelang(
 +                    hidden_states, residual, post_mix, res_mix
 +                )
-+                aux_hidden_states.append(
-+                    aux_recon.flatten(1)
-+                    if self._aux_flatten_hc
-+                    else aux_recon.mean(dim=1)
-+                )
++                if self._aux_flatten_hc:
++                    # DFlash drafts ("multi-stream hidden states"): the RAW
++                    # residual streams, flattened [T, hc_mult*hidden] — not
++                    # the mhc_post reconstruction.
++                    aux_hidden_states.append(hidden_states.flatten(1))
++                else:
++                    aux_hidden_states.append(aux_recon.mean(dim=1))
 +                final_aux_recon = aux_recon
          if layer is not None:
 -            hidden_states = mhc_post_tilelang(
@@ -11406,7 +11440,7 @@ index aa60ad3..06307f6 100644
  
          hidden_states = hc_head_fused_kernel_tilelang(
              hidden_states,
-@@ -1088,6 +1128,8 @@ class DeepseekV4Model(nn.Module):
+@@ -1088,6 +1130,8 @@ class DeepseekV4Model(nn.Module):
              self.hc_eps,
          )
          hidden_states = self.norm(hidden_states)
@@ -11415,7 +11449,7 @@ index aa60ad3..06307f6 100644
          return hidden_states
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-@@ -1314,7 +1356,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
+@@ -1314,7 +1358,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
              moe.experts.update_expert_map()
  
  

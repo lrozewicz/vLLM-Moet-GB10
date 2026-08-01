@@ -50,6 +50,15 @@ while true; do
     psi=$(awk '/^full/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){split($i,x,"="); printf "%d", x[2]}}' \
           /proc/pressure/memory 2>/dev/null)
     psi=${psi:-0}
+    # BOOT-ONLY guard: gdy serwer wstal, detektor "braku postepu" nie ma sensu
+    # (znaczniki bootu przestaja sie zmieniac podczas serwowania) - konczymy.
+    # Lekcja 2026-08-01: guard zostawiony na serwujacym procesie ubil go po
+    # 20 min "stalla", zrywajac sesje uzytkownika (Bad Gateway na proxy).
+    if docker logs "$C" 2>&1 | grep -q "Application startup complete"; then
+        echo "$(date -Is) serwer wstal - koniec czuwania (guard jest boot-only)" >> "$LOG"
+        exit 0
+    fi
+
     # znacznik postepu = ostatnia zbudowana warstwa + ostatni shard
     mark=$(docker logs "$C" 2>&1 | grep -oE "layer [0-9]+ planes built|Completed \| [0-9]+/[0-9]+" | tail -2 | tr '\n' ' ')
 

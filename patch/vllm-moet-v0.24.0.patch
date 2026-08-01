@@ -1866,6 +1866,25 @@ index 27a85bb..11eb233 100755
      ray_noset_env_vars = [
          # Refer to
          # https://github.com/ray-project/ray/blob/c584b1ea97b00793d1def71eaf81537d70efba42/python/ray/_private/accelerators/nvidia_gpu.py#L11
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index 3eec58a..c5cc180 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -592,7 +592,13 @@ class Attention(nn.Module, AttentionLayerBase):
+         assert self.attn_type == AttentionType.DECODER
+         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+         if self.sliding_window is not None:
+-            assert not vllm_config.model_config.use_mla, (
++            # Layer-scoped check: this class is plain (non-MLA) attention, so
++            # a sliding-window layer here is always legal — even when the
++            # TARGET model is MLA (model_config.use_mla True). That happens
++            # with heterogeneous speculators: a GQA sliding-window DFlash
++            # draft attached to an MLA DeepSeek target. MLA layers use
++            # MLAAttention and never reach this spec path.
++            assert not getattr(self, "use_mla", False), (
+                 "MLA is not supported for slidingwindow"
+             )
+             return SlidingWindowSpec(
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
 index 051468e..9e5cc3d 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py

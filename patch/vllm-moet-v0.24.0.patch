@@ -10440,10 +10440,41 @@ index 88f33ac..546f922 100644
          super().__init__()
          self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
-index 820260f..6340e22 100644
+index 820260f..fce6122 100644
 --- a/vllm/model_executor/models/qwen3_dflash.py
 +++ b/vllm/model_executor/models/qwen3_dflash.py
-@@ -345,7 +345,7 @@ class DFlashQwen3Model(nn.Module):
+@@ -237,6 +237,21 @@ class DFlashQwen3Model(nn.Module):
+ 
+         current_vllm_config = get_current_vllm_config()
+ 
++        # MLA targets (DeepSeek V4/R1 family): the global cache dtype resolves
++        # to an MLA-specific KV layout (fp8_ds_mla) that no plain-attention
++        # backend can serve, and the draft is a regular GQA transformer. Give
++        # the draft's layers their own cache config with the default dtype;
++        # its KV lands in a separate cache group (sliding-window, so the cost
++        # is bounded by the window, not the context).
++        draft_cache_config = current_vllm_config.cache_config
++        if draft_cache_config is not None and str(
++            getattr(draft_cache_config, "cache_dtype", "auto")
++        ).startswith("fp8_ds_mla"):
++            import copy
++
++            draft_cache_config = copy.deepcopy(draft_cache_config)
++            draft_cache_config.cache_dtype = "auto"
++
+         self.embed_tokens = VocabParallelEmbedding(
+             self.config.vocab_size,
+             self.config.hidden_size,
+@@ -248,7 +263,7 @@ class DFlashQwen3Model(nn.Module):
+                 DFlashQwen3DecoderLayer(
+                     current_vllm_config,
+                     config=self.config,
+-                    cache_config=current_vllm_config.cache_config,
++                    cache_config=draft_cache_config,
+                     quant_config=self.quant_config,
+                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                 )
+@@ -345,7 +360,7 @@ class DFlashQwen3Model(nn.Module):
          self,
          context_states: torch.Tensor,
          context_positions: torch.Tensor,
@@ -10452,7 +10483,7 @@ index 820260f..6340e22 100644
      ) -> None:
          """Precompute K/V for context states write them into each layer's KV cache.
  
-@@ -424,7 +424,13 @@ class DFlashQwen3Model(nn.Module):
+@@ -424,7 +439,13 @@ class DFlashQwen3Model(nn.Module):
  
          # --- Per-layer cache insert ---
          all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
@@ -10466,7 +10497,7 @@ index 820260f..6340e22 100644
              attn = self._attn_layers[i]
              kv_cache = attn.kv_cache
              attn.impl.do_kv_cache_update(
-@@ -432,7 +438,7 @@ class DFlashQwen3Model(nn.Module):
+@@ -432,7 +453,7 @@ class DFlashQwen3Model(nn.Module):
                  all_k_final[i],
                  all_v[i],
                  kv_cache,
@@ -10475,7 +10506,7 @@ index 820260f..6340e22 100644
              )
  
      def forward(
-@@ -559,7 +565,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+@@ -559,7 +580,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
          self,
          context_states: torch.Tensor,
          context_positions: torch.Tensor,

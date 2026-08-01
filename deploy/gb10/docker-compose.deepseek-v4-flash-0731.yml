@@ -1,0 +1,154 @@
+# DeepSeek-V4-Flash-0731 (285B MoE) on a SINGLE NVIDIA GB10 box (DGX Spark /
+# ASUS Ascent GX10 / other GB10 systems, 121.6 GiB unified memory).
+#
+# This is the exact configuration measured working end-to-end (see README for
+# numbers: ~9.8 tok/s decode with DSpark k=2, 256K context, first boot ~35 min,
+# later boots ~10 min via the persistent planes cache).
+#
+# ============================ WHY THESE KNOBS =================================
+#
+# THE UNIFIED-MEMORY WALL (the reason a stock config cannot boot here):
+#   With the FP4 delta tier enabled and no VLLM_MOE_W2_STORE_DIR, the tier's
+#   host store is PINNED host RAM — ~3.0 GiB per layer (256 experts x 12 MiB
+#   slots) on top of the 1.69 GiB/layer of 2-bit planes. On a discrete GPU
+#   host RAM is a separate pool and nobody notices; on GB10 host RAM IS VRAM:
+#   43 x (1.69 + 3.0) + ~10 GiB dense ≈ 212 GiB on a 121.6 GiB machine. Boot
+#   wedges around layer 15-18, unkillably (pinned pages neither swap nor drop).
+#   VLLM_MOE_W2_STORE_DIR switches the store to a pack file on NVMe and the
+#   load-time growth falls back to the planes alone.
+#
+# DIAGNOSING MEMORY ON UNIFIED-MEMORY BOXES:
+#   MemAvailable is NOT a danger signal here (it can read 0 with the machine
+#   healthy, and healthy with the machine wedged). Watch /proc/pressure/memory
+#   (the `full` line) and progress in the container log instead. cudaMalloc is
+#   backed by shmem: `Shmem` in /proc/meminfo ≈ total GPU allocation.
+#
+# ============================================================================
+
+services:
+  deepseek-moet:
+    image: vllm-moet-gb10:latest
+    container_name: deepseek-moet
+    # "no", NOT "unless-stopped": during diagnosis an auto-restart loop resets
+    # the tensor counters every cycle and masks the real error message.
+    restart: "no"
+    ipc: host
+    ports:
+      - "8000:8000"
+    volumes:
+      # Stock HF checkpoint (~156 GB), downloaded separately — the container
+      # starts fully offline (see env below).
+      - /path/to/models/deepseek-v4-flash-0731:/model:ro
+      # torch.compile / cudagraph caches — persist across restarts.
+      - /path/to/models/deepseek-v4-flash-0731-cache:/root/.cache
+      # Persistent planes cache (quantization results). After the first boot
+      # every later boot LOADER-SKIPs the checkpoint entirely: no staging, no
+      # requant — ~10 min to serving. ~202 GiB. Sequential I/O — a slower
+      # (USB/SATA) disk is fine here.
+      - /path/to/packs:/packs
+      # FP4 delta-tier pack (the unified-memory fix). Random reads at serve
+      # time (gate promotions) — put this on the INTERNAL NVMe. ~132 GiB.
+      - /path/to/nvme-packs:/packs-nvme
+    environment:
+      # --- vLLM-Moet core ---
+      - VLLM_MOE_W2=1                  # 2-bit expert planes. Without it the
+                                       #   155 GiB checkpoint cannot fit at all.
+      # EXPLICIT pool size, not "auto": auto sizes from mem_get_info after KV
+      # allocation, and on unified memory that number is detached from reality
+      # (measured: util 0.85 -> 0.92 did not change "free" at all). 10 GiB is
+      # comfortably above the fire floor (43 layers x top-6 x 12 MiB slots =
+      # 3.0 GiB decode working set, hard floor 1.15x) -> strict replay, no
+      # degraded mode.
+      - VLLM_MOE_W2_DELTA_GB=10
+      # >>> THE unified-memory fix: FP4 tier host store on NVMe, not pinned RAM.
+      - VLLM_MOE_W2_STORE_DIR=/packs-nvme
+      # Persistent quantization cache -> LOADER-SKIP on every boot after the first.
+      - VLLM_MOE_W2_PLANES_CACHE=/packs/planes-cache
+      # Confidence gate: low-confidence steps are re-decided on FP4-promoted
+      # experts (promote -> re-forward fixed point). This is what recovers
+      # quality over bare 2-bit.
+      - VLLM_MOE_W2_GATE=1
+      # The resident-fit boot guard reads torch.cuda.mem_get_info, which on
+      # unified memory counts the streamer's page cache as "used" and cannot
+      # see that the explicit pool above is already allocated. Measured: guard
+      # saw "free 49.4 GiB" with 117 GiB MemAvailable and refused a config
+      # that serves fine. This is the code's explicit consent valve; a real
+      # shortfall still fails as a plain torch OOM.
+      - VLLM_MOE_W2_FORCE_RESIDENT=1
+      # Return allocator segments eagerly — on unified memory every retained
+      # buffer is real silicon.
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # --- startup hygiene: zero network = zero silent hangs ---
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - HF_HUB_DISABLE_XET=1
+      - TOKENIZERS_PARALLELISM=false
+      - VLLM_API_KEY=${VLLM_API_KEY:-change-me}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120m               # first boot quantizes 277B params —
+                                       #   do not let a watchdog kill it midway
+    command:
+      - "--model=/model"
+      - "--served-model-name"
+      - "deepseek-v4-flash-0731"
+      - "deepseek-v4-flash-0731-think"   # second alias: per-request thinking
+                                         #   toggle via chat_template_kwargs
+      # Per-request delegation by chat_template_kwargs.enable_thinking:
+      #   true  -> R1-style parser (reasoning/content split on </think>)
+      #   false -> identity (chat responses untouched)
+      - "--reasoning-parser=deepseek_v3"
+      # Tool calling (agents, OpenAI tool_choice=auto). "deepseek_v4" is the
+      # DSML grammar of this checkpoint — name from the registry, not guessed.
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser=deepseek_v4"
+      - "--host=0.0.0.0"
+      - "--port=8000"
+      - "--trust-remote-code"
+      - "--tokenizer-mode=deepseek_v4"
+      # Loader WITHOUT mmap — without this the boot does NOT pass on GB10:
+      # the default safetensors loader mmaps shards and never releases the
+      # mappings; a 155 GiB checkpoint vs 121 GiB of memory wedges the box
+      # around layer 17 (PSI full 75%, unkillable). The Run:ai streamer reads
+      # into its own buffers with a HARD memory cap.
+      - "--load-format=runai_streamer"
+      - "--model-loader-extra-config"
+      - '{"concurrency": 2, "memory_limit": 2147483648}'
+      # fp8 KV REQUIRED: the nvfp4 KV path is compiled sm_120a (device-specific)
+      # and cannot start on sm_121.
+      - "--kv-cache-dtype=fp8"
+      - "--block-size=256"
+      - "--max-model-len=262144"   # 256K. KV is cheap on DS4 (MLA + the
+                                   #   compress ladder ≈ 7 KB/token effective;
+                                   #   the pool holds ~660K tokens). The model
+                                   #   is natively 1M (YaRN); the practical
+                                   #   ceiling is PREFILL TIME, not memory.
+      - "--gpu-memory-utilization=0.92"
+      - "--max-num-seqs=2"         # exactly 2: the V2 runner's sparse-MLA
+                                   #   warmup schedules 2 synthetic requests;
+                                   #   with 1 it dies with "No free indices".
+      - "--max-num-batched-tokens=2048"  # prefill is weight-read-bound, so the
+                                         #   chunk scales ~linearly: 512 gave
+                                         #   ~250 tok/s prefill, 2048 ~2.2x that
+      - "--no-scheduler-reserve-full-isl"
+      - "--tensor-parallel-size=1"
+      # Speculative decoding: DSpark k=2 — the native 0731 drafter head.
+      # MEASURED on GB10: k=2 = 9.8 tok/s; k=7 (the model card default) =
+      # 5.1 tok/s — positions 4-7 accept ~0% and seven sequential drafter
+      # passes per step eat the 273 GB/s bandwidth. Do not raise k.
+      # NOTE: "deepseek_mtp" does NOT work with 0731 (different head
+      # architecture: main_norm/main_proj + a 3-block mtp stack).
+      - "--speculative-config"
+      - '{"method":"dspark","num_speculative_tokens":2,"draft_sample_method":"greedy"}'
+      - "--compilation-config"
+      - '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'

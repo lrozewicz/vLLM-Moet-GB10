@@ -1,4 +1,4 @@
-# DeepSeek-V4-Flash-0731 (285B MoE) on a SINGLE NVIDIA GB10 box (DGX Spark /
+# DeepSeek-V4-Flash-0731 (304B MoE) on a SINGLE NVIDIA GB10 box (DGX Spark /
 # ASUS Ascent GX10 / other GB10 systems, 121.6 GiB unified memory).
 #
 # This is the exact configuration measured working end-to-end (see README for

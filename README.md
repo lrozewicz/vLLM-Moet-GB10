@@ -1,6 +1,6 @@
 # vLLM-Moet-GB10
 
-**Run DeepSeek-V4-Flash-0731 (285B MoE) on a single NVIDIA GB10 box** — NVIDIA
+**Run DeepSeek-V4-Flash-0731 (304B MoE: 284B main model + 20B built-in DSpark speculator head) on a single NVIDIA GB10 box** — NVIDIA
 DGX Spark, ASUS Ascent GX10, and other GB10 systems with 121.6 GiB of unified
 memory. Measured: **~9.8 tok/s decode** with speculative decoding, **256K
 context**, quality-recovering FP4 tier, tool calling and split reasoning for

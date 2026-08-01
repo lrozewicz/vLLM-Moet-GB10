@@ -11277,7 +11277,7 @@ index 0000000..be4a87b
 +            return f"model.{rest}"
 +        return f"model.layers.{stage}.{rest}"
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index aa60ad3..66fbd00 100644
+index aa60ad3..06307f6 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -46,7 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -11303,7 +11303,25 @@ index aa60ad3..66fbd00 100644
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
  
-@@ -1005,7 +1010,10 @@ class DeepseekV4Model(nn.Module):
+@@ -941,6 +946,17 @@ class DeepseekV4Model(nn.Module):
+         self.hc_dim = self.hc_mult * config.hidden_size
+         self.rms_norm_eps = config.rms_norm_eps
+ 
++        # Aux hidden-state layout for draft models: DFlash speculators
++        # (RedHatAI/DeepSeek-V4-Flash-speculator.dflash) are trained on the
++        # RAW hyper-connection states flattened to [T, hc_mult*hidden]
++        # (their fc expects n_aux_layers * hc_dim inputs — same flatten(1)
++        # convention as the MTP pre-hc buffer). The mean(dim=1) reduction
++        # stays for every other consumer.
++        spec_cfg = vllm_config.speculative_config
++        self._aux_flatten_hc = (
++            spec_cfg is not None and getattr(spec_cfg, "method", None) == "dflash"
++        )
++
+         # Three aux streams: one per non-default input GEMM in
+         # DeepseekV4Attention.attn_gemm_parallel_execute
+         # (compressor kv_score, indexer.weights_proj, indexer.compressor
+@@ -1005,7 +1021,10 @@ class DeepseekV4Model(nn.Module):
          # refreshes it correctly across captured shapes. Only allocated on
          # the last PP rank — that's where MTP target hidden states are
          # produced.
@@ -11315,7 +11333,7 @@ index aa60ad3..66fbd00 100644
              self._mtp_hidden_buffer = torch.empty(
                  vllm_config.scheduler_config.max_num_batched_tokens,
                  self.hc_dim,
-@@ -1058,7 +1066,12 @@ class DeepseekV4Model(nn.Module):
+@@ -1058,7 +1077,12 @@ class DeepseekV4Model(nn.Module):
              input_ids = input_ids.to(torch.int64)
  
          residual, post_mix, res_mix = None, None, None
@@ -11329,7 +11347,7 @@ index aa60ad3..66fbd00 100644
              hidden_states, residual, post_mix, res_mix = layer(
                  hidden_states,
                  positions,
-@@ -1067,17 +1080,29 @@ class DeepseekV4Model(nn.Module):
+@@ -1067,17 +1091,33 @@ class DeepseekV4Model(nn.Module):
                  res_mix,
                  residual,
              )
@@ -11338,7 +11356,11 @@ index aa60ad3..66fbd00 100644
 +                aux_recon = mhc_post_tilelang(
 +                    hidden_states, residual, post_mix, res_mix
 +                )
-+                aux_hidden_states.append(aux_recon.mean(dim=1))
++                aux_hidden_states.append(
++                    aux_recon.flatten(1)
++                    if self._aux_flatten_hc
++                    else aux_recon.mean(dim=1)
++                )
 +                final_aux_recon = aux_recon
          if layer is not None:
 -            hidden_states = mhc_post_tilelang(
@@ -11365,7 +11387,7 @@ index aa60ad3..66fbd00 100644
  
          hidden_states = hc_head_fused_kernel_tilelang(
              hidden_states,
-@@ -1088,6 +1113,8 @@ class DeepseekV4Model(nn.Module):
+@@ -1088,6 +1128,8 @@ class DeepseekV4Model(nn.Module):
              self.hc_eps,
          )
          hidden_states = self.norm(hidden_states)
@@ -11374,7 +11396,7 @@ index aa60ad3..66fbd00 100644
          return hidden_states
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-@@ -1314,7 +1341,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
+@@ -1314,7 +1356,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
              moe.experts.update_expert_map()
  
  

@@ -13919,6 +13919,53 @@ index dbe3c57..f12d719 100644
  
      _fwd_grouped_kernel_stage1[grid](
          q,
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index b13c23d..e6a0a61 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1512,6 +1512,12 @@ def group_and_unify_kv_cache_specs(
+     grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
+         dict
+     )
++    # Non-MLA layers on an MLA target: a heterogeneous speculator (e.g. the
++    # DFlash GQA sliding-window draft) contributes plain attention specs.
++    # Bucket them by (spec type, block_size, sliding_window) into their own
++    # uniform groups — dropping them tripped the "Some layers are not
++    # assigned to any group" assert downstream.
++    grouped_other_specs: dict[tuple, dict[str, KVCacheSpec]] = defaultdict(dict)
+     # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
+     # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
+     # be fragile with only block_size and sliding_window as keys, but fine for now.
+@@ -1520,6 +1526,14 @@ def group_and_unify_kv_cache_specs(
+             grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+         elif isinstance(spec, MLAAttentionSpec):
+             mla_specs[name] = spec
++        else:
++            grouped_other_specs[
++                (
++                    type(spec).__name__,
++                    spec.block_size,
++                    getattr(spec, "sliding_window", None),
++                )
++            ][name] = spec
+ 
+     assert len(mla_specs) > 0
+     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
+@@ -1531,7 +1545,13 @@ def group_and_unify_kv_cache_specs(
+         assert uniform_spec is not None
+         swa_uniform_specs.append(uniform_spec)
+ 
+-    return [mla_uniform_spec, *swa_uniform_specs]
++    other_uniform_specs: list[UniformTypeKVCacheSpecs] = []
++    for spec_dict in grouped_other_specs.values():
++        uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
++        assert uniform_spec is not None
++        other_uniform_specs.append(uniform_spec)
++
++    return [mla_uniform_spec, *swa_uniform_specs, *other_uniform_specs]
+ 
+ 
+ def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
 index 90d93a1..418f333 100644
 --- a/vllm/v1/core/sched/scheduler.py

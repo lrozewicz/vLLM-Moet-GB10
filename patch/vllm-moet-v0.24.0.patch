@@ -13920,7 +13920,7 @@ index dbe3c57..f12d719 100644
      _fwd_grouped_kernel_stage1[grid](
          q,
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index b13c23d..e6a0a61 100644
+index b13c23d..56e0a8f 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
 @@ -1512,6 +1512,12 @@ def group_and_unify_kv_cache_specs(
@@ -13966,6 +13966,45 @@ index b13c23d..e6a0a61 100644
  
  
  def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
+@@ -1578,6 +1598,21 @@ def _get_kv_cache_groups_uniform_groups(
+     assert len(grouped_specs) > 0 and all(
+         isinstance(spec, UniformTypeKVCacheSpecs) for spec in grouped_specs
+     )
++    # Non-MLA uniform groups (heterogeneous speculator drafts, e.g. the
++    # DFlash GQA sliding-window draft on a DeepSeek V4 target) take no part
++    # in the MLA layer-tuple alignment below: the packed config planner
++    # buckets their pages independently (one tensor per (slot, page_size),
++    # per-group block tables). Split them off and append as plain groups.
++    other_grouped = [
++        g
++        for g in grouped_specs
++        if not all(
++            isinstance(s, (MLAAttentionSpec, SlidingWindowMLASpec))
++            for s in g.kv_cache_specs.values()
++        )
++    ]
++    if other_grouped:
++        grouped_specs = [g for g in grouped_specs if g not in other_grouped]
+     # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs
+     # containing only MLAAttentionSpec.
+     full_mla_spec = grouped_specs[0]
+@@ -1667,7 +1702,15 @@ def _get_kv_cache_groups_uniform_groups(
+                 )
+             )
+ 
+-    return [full_mla_group, *swa_mla_groups]
++    other_groups = [
++        KVCacheGroupSpec(
++            layer_names=list(g.kv_cache_specs.keys()),
++            kv_cache_spec=g,
++        )
++        for g in other_grouped
++    ]
++
++    return [full_mla_group, *swa_mla_groups, *other_groups]
+ 
+ 
+ def _annotate_eagle_groups_deepseek_v4(
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
 index 90d93a1..418f333 100644
 --- a/vllm/v1/core/sched/scheduler.py

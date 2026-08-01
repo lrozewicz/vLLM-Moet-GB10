@@ -54,7 +54,11 @@ while true; do
     # (znaczniki bootu przestaja sie zmieniac podczas serwowania) - konczymy.
     # Lekcja 2026-08-01: guard zostawiony na serwujacym procesie ubil go po
     # 20 min "stalla", zrywajac sesje uzytkownika (Bad Gateway na proxy).
-    if docker logs "$C" 2>&1 | grep -q "Application startup complete"; then
+    # --since od ostatniego startu kontenera: docker logs AKUMULUJE sie miedzy
+    # restartami tego samego kontenera, a stary "startup complete" nie moze
+    # konczyc czuwania nad swiezym bootem.
+    STARTED=$(docker inspect -f "{{.State.StartedAt}}" "$C" 2>/dev/null)
+    if docker logs --since "$STARTED" "$C" 2>&1 | grep -q "Application startup complete"; then
         echo "$(date -Is) serwer wstal - koniec czuwania (guard jest boot-only)" >> "$LOG"
         exit 0
     fi

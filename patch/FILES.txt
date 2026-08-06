@@ -39,6 +39,8 @@ vllm/models/deepseek_v4/nvidia/dspark.py
 vllm/models/deepseek_v4/nvidia/model.py
 vllm/models/deepseek_v4/nvidia/mtp.py
 vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+vllm/parser/abstract_parser.py
+vllm/reasoning/deepseek_v3_reasoning_parser.py
 vllm/transformers_utils/configs/speculators/algos.py
 vllm/utils/flashinfer.py
 vllm/v1/attention/backends/flashinfer.py

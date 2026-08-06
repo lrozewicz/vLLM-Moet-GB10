@@ -7761,10 +7761,10 @@ index 0000000..4574d5c
 +            + "; ".join(str(e) for e in errors))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 0000000..f01adef
+index 0000000..c9da356
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,347 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -7886,6 +7886,11 @@ index 0000000..f01adef
 +# no scalar or fitted combination beat max_prob materially (live labels
 +# 10.9% -> 10.3% fire@recall90), so max_prob stays the only signal here.
 +_SPEC_MASK = os.getenv("VLLM_MOE_W2_GATE_SPEC_MASK", "0") == "1"
++
++
++def spec_mask_enabled() -> bool:
++    """Public probe for runner-side spec-metadata plumbing (V2 port)."""
++    return _SPEC_MASK
 +
 +# observability (cheap; only mutated when the gate is enabled)
 +_n_steps = 0
@@ -11509,6 +11514,298 @@ index 18e3b10..d536692 100644
      return einsum_recipe, tma_aligned_scales
  
  
+diff --git a/vllm/parser/abstract_parser.py b/vllm/parser/abstract_parser.py
+index 11fca8e..0c7b3c8 100644
+--- a/vllm/parser/abstract_parser.py
++++ b/vllm/parser/abstract_parser.py
+@@ -739,8 +739,29 @@ class DelegatingParser(Parser):
+             request=request,
+             enable_auto_tools=enable_auto_tools,
+         )
++        late_reasoning, content = self._route_late_content(content, finished=True)
++        if late_reasoning:
++            reasoning = (reasoning or "") + late_reasoning
+         return reasoning, content, tool_calls
+ 
++    def _route_late_content(
++        self, content: str | None, *, finished: bool
++    ) -> tuple[str | None, str | None]:
++        """Give the reasoning parser a second look at final content.
++
++        The reasoning phase is a one-way latch: after it closes (which for
++        thinking-disabled requests happens at prompt inspection, before the
++        first token) the reasoning parser is never consulted again. Parsers
++        that implement ``route_late_content`` can still claim reasoning
++        markup appearing in that content - e.g. agent-tuned checkpoints
++        that reopen a <think> block mid-answer, which would otherwise reach
++        the client verbatim. Parsers without the hook are unaffected.
++        """
++        route = getattr(self._reasoning_parser, "route_late_content", None)
++        if route is None or (not content and not finished):
++            return None, content
++        return route(content or "", finished=finished)
++
+     def parse_delta(
+         self,
+         delta_text: str,
+@@ -867,6 +888,28 @@ class DelegatingParser(Parser):
+             delta_message = self.finalize_generation(delta_message, request, state)
+             delta_message = self._flush_engine_parsers(delta_message)
+ 
++        if state.reasoning_ended and not reasoning_transitioned:
++            # Post-latch: the reasoning parser no longer sees this text, so
++            # give it a chance to claim reasoning markup left in content.
++            late_reasoning, late_content = self._route_late_content(
++                delta_message.content if delta_message else None,
++                finished=finished,
++            )
++            if late_reasoning or late_content != (
++                delta_message.content if delta_message else None
++            ):
++                if delta_message is None:
++                    if late_reasoning or late_content:
++                        delta_message = DeltaMessage(
++                            reasoning=late_reasoning, content=late_content
++                        )
++                else:
++                    delta_message.content = late_content
++                    if late_reasoning:
++                        delta_message.reasoning = (
++                            delta_message.reasoning or ""
++                        ) + late_reasoning
++
+         return delta_message
+ 
+     def _flush_engine_parsers(
+diff --git a/vllm/reasoning/deepseek_v3_reasoning_parser.py b/vllm/reasoning/deepseek_v3_reasoning_parser.py
+index dbaf0b1..56b4115 100644
+--- a/vllm/reasoning/deepseek_v3_reasoning_parser.py
++++ b/vllm/reasoning/deepseek_v3_reasoning_parser.py
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from collections.abc import Iterable, Sequence
+ from typing import TYPE_CHECKING
+ 
+ from transformers import PreTrainedTokenizerBase
+ 
++from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+ from vllm.reasoning import ReasoningParser
+ from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
+ 
+@@ -13,14 +15,176 @@ from .identity_reasoning_parser import IdentityReasoningParser
+ 
+ if TYPE_CHECKING:
+     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+-    from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+ 
++_THINK_START = "<think>"
++_THINK_END = "</think>"
++
++
++def _route_think_blocks(
++    text: str, in_think: bool, holdback: bool
++) -> tuple[list[tuple[str, str]], bool, str]:
++    """Split `text` into ("reasoning"|"content", chunk) segments, routing the
++    inside of every <think>...</think> span to reasoning and stripping the
++    tags themselves. Tags may appear anywhere and any number of times; a
++    duplicate <think> while already thinking is stripped as a no-op.
++
++    Returns (segments, new_in_think, pending): with `holdback`, a trailing
++    substring that could still grow into a tag on the next streaming delta is
++    withheld and returned as `pending` instead of being emitted.
++    """
++    segments: list[tuple[str, str]] = []
++    pending = ""
++    while text:
++        i = text.find("<")
++        if i == -1:
++            segments.append(("reasoning" if in_think else "content", text))
++            return segments, in_think, pending
++        if i > 0:
++            segments.append(("reasoning" if in_think else "content", text[:i]))
++            text = text[i:]
++        if text.startswith(_THINK_END):
++            in_think = False
++            text = text[len(_THINK_END) :]
++        elif text.startswith(_THINK_START):
++            in_think = True
++            text = text[len(_THINK_START) :]
++        elif holdback and (
++            _THINK_START.startswith(text) or _THINK_END.startswith(text)
++        ):
++            # The tail might complete into a tag with the next delta.
++            pending = text
++            return segments, in_think, pending
++        else:
++            # A lone "<" that is not (a prefix of) either tag: literal text.
++            segments.append(("reasoning" if in_think else "content", text[0]))
++            text = text[1:]
++    return segments, in_think, pending
++
++
++class ThinkBlockRouterParser(ReasoningParser):
++    """Routes EVERY <think>...</think> span to `reasoning`, wherever it
++    appears in the output, and never leaks the tags into `content`.
++
++    Why this exists: the stock delegation (R1 parser for thinking mode,
++    Identity otherwise) assumes at most one reasoning block at the very
++    start of the output. DS4-Flash-0731 is agent-tuned and at temperature
++    1.0 (on 2-bit-flattened logits) it occasionally REOPENS a <think>
++    block mid-answer, or opens one spontaneously with thinking disabled —
++    both leak raw "</think>" text to clients (observed in OpenCode,
++    2026-08-06). This parser is state-driven, purely text-based (robust
++    to arbitrary token chunking, e.g. multi-token speculative deltas) and
++    handles any number of blocks in both modes.
++
++    `initial_in_think=True` models a chat template that pre-filled
++    <think> (thinking mode); an explicit leading <think> in the output is
++    stripped as a duplicate either way.
++    """
++
++    def __init__(
++        self,
++        tokenizer: PreTrainedTokenizerBase,
++        *args,
++        initial_in_think: bool = False,
++        **kwargs,
++    ):
++        super().__init__(tokenizer, *args, **kwargs)
++        self._initial_in_think = initial_in_think
++        self._in_think = initial_in_think
++        self._pending = ""
++        # Separate state for the post-latch (late) content pass.
++        self._late_in_think = False
++        self._late_pending = ""
++
++    @property
++    def reasoning_start_str(self) -> str | None:
++        return _THINK_START
++
++    @property
++    def reasoning_end_str(self) -> str | None:
++        return _THINK_END
++
++    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
++        return not self._in_think
++
++    def is_reasoning_end_streaming(
++        self, input_ids: Sequence[int], delta_ids: Iterable[int]
++    ) -> bool:
++        return not self._in_think
++
++    def extract_content_ids(self, input_ids: list[int]) -> list[int]:
++        # Identity approximation: structured-output constraining over the
++        # exact content span is not distinguishable here without a second
++        # detokenization pass; matches the pre-existing non-think behavior.
++        return input_ids
++
++    def extract_reasoning_streaming(
++        self,
++        previous_text: str,
++        current_text: str,
++        delta_text: str,
++        previous_token_ids: Sequence[int],
++        current_token_ids: Sequence[int],
++        delta_token_ids: Sequence[int],
++    ) -> DeltaMessage | None:
++        if not delta_text and not self._pending:
++            return None
++        segments, self._in_think, self._pending = _route_think_blocks(
++            self._pending + delta_text, self._in_think, holdback=True
++        )
++        reasoning = "".join(t for k, t in segments if k == "reasoning")
++        content = "".join(t for k, t in segments if k == "content")
++        if not reasoning and not content:
++            return None
++        return DeltaMessage(
++            reasoning=reasoning or None, content=content or None
++        )
++
++    def extract_reasoning(
++        self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
++    ) -> tuple[str | None, str | None]:
++        segments, _, _ = _route_think_blocks(
++            model_output, self._initial_in_think, holdback=False
++        )
++        reasoning = "".join(t for k, t in segments if k == "reasoning")
++        content = "".join(t for k, t in segments if k == "content")
++        return reasoning or None, content if content else None
++
++    def route_late_content(
++        self, text: str, *, finished: bool
++    ) -> tuple[str | None, str | None]:
++        """Route <think> blocks found in content AFTER the reasoning phase.
++
++        DelegatingParser latches `reasoning_ended` one-way: once the
++        reasoning phase closes (immediately, at prompt inspection, when
++        thinking is disabled), the reasoning parser is never consulted
++        again and everything flows through the tool parser / passthrough.
++        Agent-tuned checkpoints do reopen <think> mid-answer, so without a
++        late pass those blocks reach the client verbatim.
++
++        Keeps state separate from the reasoning-phase machine (that one
++        stopped at the latch) and holds back a partial tag until the next
++        delta; `finished` flushes it.
++        """
++        segments, self._late_in_think, self._late_pending = _route_think_blocks(
++            self._late_pending + text, self._late_in_think, holdback=not finished
++        )
++        reasoning = "".join(t for k, t in segments if k == "reasoning")
++        content = "".join(t for k, t in segments if k == "content")
++        if finished and self._late_pending:
++            content += self._late_pending
++            self._late_pending = ""
++        return reasoning or None, content or None
++
+ 
+ class DeepSeekV3ReasoningParser(ReasoningParser):
+     """
+-    V3 parser that delegates to either DeepSeekR1ReasoningParser or
+-    IdentityReasoningParser based on `thinking` and `separate_reasoning`.
++    V3 parser that delegates based on `thinking` / `enable_thinking`.
++
++    Default: ThinkBlockRouterParser in both modes (initial state differs),
++    so spontaneous or reopened <think> blocks never leak raw tags to
++    content. VLLM_DS_V3_LEGACY_REASONING=1 restores the stock delegation
++    (R1 for thinking, Identity otherwise).
+     """
+ 
+     def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
+@@ -31,11 +195,27 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
+         enable_thinking = bool(chat_kwargs.get("enable_thinking", False))
+         thinking = thinking or enable_thinking
+ 
++        legacy = os.getenv("VLLM_DS_V3_LEGACY_REASONING", "0") == "1"
+         self._parser: ReasoningParser
+-        if thinking:
+-            self._parser = DeepSeekR1ReasoningParser(tokenizer, *args, **kwargs)
++        if legacy:
++            if thinking:
++                self._parser = DeepSeekR1ReasoningParser(tokenizer, *args, **kwargs)
++            else:
++                self._parser = IdentityReasoningParser(tokenizer, *args, **kwargs)
+         else:
+-            self._parser = IdentityReasoningParser(tokenizer, *args, **kwargs)
++            self._parser = ThinkBlockRouterParser(
++                tokenizer, *args, initial_in_think=thinking, **kwargs
++            )
++
++    def route_late_content(
++        self, text: str, *, finished: bool
++    ) -> tuple[str | None, str | None]:
++        """See ThinkBlockRouterParser.route_late_content. In legacy mode the
++        content is returned unchanged (stock behavior)."""
++        route = getattr(self._parser, "route_late_content", None)
++        if route is None:
++            return None, text or None
++        return route(text, finished=finished)
+ 
+     @property
+     def reasoning_start_str(self) -> str | None:
 diff --git a/vllm/transformers_utils/configs/speculators/algos.py b/vllm/transformers_utils/configs/speculators/algos.py
 index 0dc3ccc..fb75a27 100644
 --- a/vllm/transformers_utils/configs/speculators/algos.py
@@ -14518,10 +14815,18 @@ index 6b750fe..167ad68 100644
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 30ca2dd..b38f678 100644
+index 30ca2dd..332e6e1 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -33,9 +33,19 @@ from vllm.config.compilation import CUDAGraphMode
+@@ -21,6 +21,7 @@ import functools
+ import gc
+ import time
+ from copy import deepcopy
++from types import SimpleNamespace
+ from typing import Any, NamedTuple
+ 
+ import numpy as np
+@@ -33,9 +34,19 @@ from vllm.config.compilation import CUDAGraphMode
  from vllm.distributed.parallel_state import (
      get_dcp_group,
      get_pp_group,
@@ -14541,7 +14846,7 @@ index 30ca2dd..b38f678 100644
  from vllm.logger import init_logger
  from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
      initialize_mamba_ssu_backend,
-@@ -47,6 +57,7 @@ from vllm.tasks import SupportedTask
+@@ -47,6 +58,7 @@ from vllm.tasks import SupportedTask
  from vllm.utils.math_utils import cdiv
  from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
  from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
@@ -14549,7 +14854,7 @@ index 30ca2dd..b38f678 100644
  from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
  from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
  from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-@@ -102,6 +113,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+@@ -102,6 +114,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
  from vllm.v1.worker.gpu.sample.sampler import Sampler
  from vllm.v1.worker.gpu.shutdown import free_before_shutdown
  from vllm.v1.worker.gpu.spec_decode import init_speculator
@@ -14557,7 +14862,7 @@ index 30ca2dd..b38f678 100644
  from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
      set_eagle3_aux_hidden_state_layers,
  )
-@@ -142,6 +154,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -142,6 +155,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # zeroing (e.g. hybrid models with fp8 KV cache).
          self.kv_block_zeroer: KVBlockZeroer | None = None
  
@@ -14569,7 +14874,7 @@ index 30ca2dd..b38f678 100644
          self.vocab_size = self.model_config.get_vocab_size()
          self.max_model_len = self.model_config.max_model_len
          self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
-@@ -186,13 +203,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -186,13 +204,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          # Speculative decoding.
          self.speculator = None
@@ -14593,7 +14898,7 @@ index 30ca2dd..b38f678 100644
                  # Drafting may require auxiliary hidden states from target model outputs
                  self.use_aux_hidden_state_outputs = True
                  if self.use_pp:
-@@ -469,6 +495,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -469,6 +496,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              cudagraph_mode,
              decode_query_len=self.decode_query_len,
              lora_capture_cases=self.lora_capture_cases,
@@ -14605,7 +14910,7 @@ index 30ca2dd..b38f678 100644
          )
          if self.speculator is not None:
              self.speculator.init_cudagraph_manager(cudagraph_mode)
-@@ -602,7 +633,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -602,7 +634,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -14616,7 +14921,7 @@ index 30ca2dd..b38f678 100644
              self.speculator.propose(
                  input_batch=input_batch,
                  attn_metadata=attn_metadata,
-@@ -685,6 +718,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -685,6 +719,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # NOTE(woosuk): It is TBD whether we keep this API or not.
          return 0
  
@@ -14694,7 +14999,7 @@ index 30ca2dd..b38f678 100644
      @torch.inference_mode()
      def capture_model(self) -> int:
          assert self.cudagraph_manager is not None
-@@ -717,6 +821,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -717,6 +822,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              )
              if self.speculator is not None:
                  self.speculator.capture(attn_states)
@@ -14702,7 +15007,7 @@ index 30ca2dd..b38f678 100644
  
          end_time = time.perf_counter()
          end_free_gpu_memory = torch.cuda.mem_get_info()[0]
-@@ -895,6 +1000,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -895,6 +1001,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  idx_mapping, total_num_logits, cu_num_logits, max_expand_len
              )
  
@@ -14723,7 +15028,7 @@ index 30ca2dd..b38f678 100644
          # Get query_start_loc.
          # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
          num_reqs_padded = batch_desc.num_reqs or num_reqs
-@@ -960,7 +1079,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -960,7 +1080,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              cu_num_logits,
              total_num_logits,
              self.model_state.num_new_sampled_tokens_per_step,
@@ -14741,7 +15046,7 @@ index 30ca2dd..b38f678 100644
  
          # CPU upper bound on seq_lens; padded entries left at zero.
          num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
-@@ -991,6 +1120,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -991,6 +1121,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_draft_tokens_per_req=num_draft_tokens_per_req,
              query_start_loc=query_start_loc,
              query_start_loc_np=query_start_loc_np,
@@ -14749,7 +15054,7 @@ index 30ca2dd..b38f678 100644
              seq_lens=seq_lens,
              seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
              dcp_local_seq_lens=dcp_local_seq_lens,
-@@ -1034,14 +1164,195 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1034,14 +1165,223 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          return block_tables, slot_mappings
  
@@ -14844,12 +15149,40 @@ index 30ca2dd..b38f678 100644
 +                def _and_tp(flag: bool) -> bool:
 +                    return _reduce_tp(flag, torch.distributed.ReduceOp.MIN)
 +
-+                # NOTE: V1 forwards spec metadata for the opt-in
-+                # GATE_SPEC_MASK relevance mask; the V2 port evaluates all
-+                # sampled positions (mask off), which is the default.
++                # GATE_SPEC_MASK (S4 parity): rebuild the V1
++                # SpecDecodeMetadata layout for the gate's relevance mask
++                # from the python-side draft dict stashed by execute_model.
++                # Host-only list work plus one tiny async H2D (k ids per
++                # request); no GPU sync. Guarded to the 1-bonus-token
++                # layout the mask assumes ([nd verify rows, bonus] per
++                # request); any shape surprise downstream degrades to
++                # mask=None (no masking).
++                spec_shim = None
++                if moe_w2_gate.spec_mask_enabled():
++                    drafts = ctx.get("spec_drafts")
++                    ndpr = input_batch.num_draft_tokens_per_req
++                    if (
++                        drafts
++                        and ndpr is not None
++                        and input_batch.num_draft_tokens > 0
++                        and self.model_state.num_new_sampled_tokens_per_step
++                        == 1
++                    ):
++                        flat: list[int] = []
++                        for rid in input_batch.req_ids:
++                            flat.extend(drafts.get(rid, ()))
++                        if flat:
++                            spec_shim = SimpleNamespace(
++                                num_draft_tokens=[int(n) for n in ndpr],
++                                draft_token_ids=torch.tensor(
++                                    flat,
++                                    dtype=torch.long,
++                                    device=logits.device,
++                                ),
++                            )
 +                decision_error: BaseException | None = None
 +                try:
-+                    fire = moe_w2_gate.should_reforward(logits)
++                    fire = moe_w2_gate.should_reforward(logits, spec_shim)
 +                except BaseException as e:  # noqa: BLE001
 +                    decision_error = e
 +                    fire = False
@@ -14947,7 +15280,7 @@ index 30ca2dd..b38f678 100644
          if grammar_output is not None:
              # Apply grammar bitmask to the logits in-place.
              assert self.structured_outputs_worker is not None
-@@ -1064,6 +1375,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1064,6 +1404,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  input_batch,
                  # Draft logits are needed for probabilistic rejection sampling.
                  self.speculator.draft_logits,
@@ -14957,7 +15290,7 @@ index 30ca2dd..b38f678 100644
              )
  
          return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
-@@ -1107,6 +1421,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1107,6 +1450,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          is_profile: bool = False,
      ) -> ModelRunnerOutput | IntermediateTensors | None:
          if not dummy_run:
@@ -14977,7 +15310,7 @@ index 30ca2dd..b38f678 100644
              # Update the request states.
              self.update_pp_decode_requests()
              self.finish_requests(scheduler_output)
-@@ -1125,6 +1452,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1125,6 +1481,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          max_query_len = max(scheduler_output.num_scheduled_tokens.values())
          uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
  
@@ -15008,7 +15341,7 @@ index 30ca2dd..b38f678 100644
          num_active_loras = 0
          if self.lora_config:
              req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-@@ -1160,6 +1511,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1160,6 +1540,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # Prepare all the inputs and copy to the input buffers.
              input_batch = self.prepare_inputs(scheduler_output, batch_desc)
              block_tables, slot_mappings = self.prepare_attn(input_batch)
@@ -15032,7 +15365,7 @@ index 30ca2dd..b38f678 100644
  
              if self.lora_config:
                  # Activate LoRA adapters.
-@@ -1252,6 +1620,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1252,6 +1649,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
              del intermediate_tensors
  
@@ -15046,7 +15379,7 @@ index 30ca2dd..b38f678 100644
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
              # Use explicit cudagraph replay for FULL mode.
-@@ -1316,6 +1691,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1316,6 +1720,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              finished_req_ids=finished_req_ids,
          )
  
@@ -15071,12 +15404,16 @@ index 30ca2dd..b38f678 100644
 +                slot_mappings_by_layer=slot_mappings_by_layer,
 +                skip_compiled=skip_compiled,
 +                num_tokens_after_padding=input_batch.num_tokens_after_padding,
++                # GATE_SPEC_MASK (S4 parity): the python-side draft dict
++                # for this verify step, so _w2_gate_and_logits can rebuild
++                # the V1 SpecDecodeMetadata layout without any GPU sync.
++                spec_drafts=scheduler_output.scheduled_spec_decode_tokens,
 +            )
 +
          if not self.is_last_pp_rank:
              # Non-last PP rank: return IntermediateTensors for sending.
              return output_intermediate_tensors
-@@ -1356,9 +1754,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1356,9 +1787,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
  
@@ -15097,7 +15434,7 @@ index 30ca2dd..b38f678 100644
          )
  
          if self.pp_handler is not None:
-@@ -1424,7 +1831,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1424,7 +1864,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              sampler_output.sampled_token_ids,
              num_sampled,
              num_rejected,
@@ -15110,7 +15447,7 @@ index 30ca2dd..b38f678 100644
          )
  
          if self.speculator is not None:
-@@ -1436,7 +1847,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1436,7 +1880,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -15121,7 +15458,7 @@ index 30ca2dd..b38f678 100644
              draft_tokens = self.speculator.propose(
                  input_batch,
                  attn_metadata,
-@@ -1451,14 +1864,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1451,14 +1897,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  self.sampler.sampling_states.seeds.gpu,
                  mm_inputs=mm_inputs,
              )
@@ -15953,10 +16290,10 @@ index 0000000..20c4152
 +        self._prev_sched_l = length
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 new file mode 100644
-index 0000000..88841d5
+index 0000000..4fcfc1e
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,308 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""DSpark speculator: semi-autoregressive parallel drafting.
@@ -16092,7 +16429,13 @@ index 0000000..88841d5
 +        # Reduced draft vocab: probabilistic rejection sampling indexes draft
 +        # logits by target id, so precompute the draft->target column map and a
 +        # scratch buffer to scatter logits into target vocab before sampling.
-+        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
++        # getattr: full-vocab draft classes (e.g. the native DSpark head) do
++        # not define the attribute at all; treat that as identity mapping
++        # instead of crashing the probabilistic load path.
++        if (
++            self.draft_logits is not None
++            and getattr(model, "draft_id_to_target_id", None) is not None
++        ):
 +            d2t = model.draft_id_to_target_id
 +            self._d2t_scatter_index = (
 +                torch.arange(d2t.shape[0], device=d2t.device) + d2t

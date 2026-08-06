@@ -2,14 +2,14 @@
 # ASUS Ascent GX10 / other GB10 systems, 121.6 GiB unified memory).
 #
 # This is the exact configuration measured working end-to-end (see README for
-# numbers: ~9.8 tok/s decode with DSpark k=2, 256K context, first boot ~35 min,
+# numbers: ~14.3 tok/s decode with DSpark k=2, 256K context, first boot ~35 min,
 # later boots ~10 min via the persistent planes cache).
 #
 # ============================ WHY THESE KNOBS =================================
 #
 # THE UNIFIED-MEMORY WALL (the reason a stock config cannot boot here):
 #   With the FP4 delta tier enabled and no VLLM_MOE_W2_STORE_DIR, the tier's
-#   host store is PINNED host RAM — ~3.0 GiB per layer (256 experts x 12 MiB
+#   host store is PINNED host RAM - ~3.0 GiB per layer (256 experts x 12 MiB
 #   slots) on top of the 1.69 GiB/layer of 2-bit planes. On a discrete GPU
 #   host RAM is a separate pool and nobody notices; on GB10 host RAM IS VRAM:
 #   43 x (1.69 + 3.0) + ~10 GiB dense ≈ 212 GiB on a 121.6 GiB machine. Boot
@@ -36,18 +36,18 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Stock HF checkpoint (~156 GB), downloaded separately — the container
+      # Stock HF checkpoint (~156 GB), downloaded separately - the container
       # starts fully offline (see env below).
       - /path/to/models/deepseek-v4-flash-0731:/model:ro
-      # torch.compile / cudagraph caches — persist across restarts.
+      # torch.compile / cudagraph caches - persist across restarts.
       - /path/to/models/deepseek-v4-flash-0731-cache:/root/.cache
       # Persistent planes cache (quantization results). After the first boot
       # every later boot LOADER-SKIPs the checkpoint entirely: no staging, no
-      # requant — ~10 min to serving. ~202 GiB. Sequential I/O — a slower
+      # requant - ~10 min to serving. ~202 GiB. Sequential I/O - a slower
       # (USB/SATA) disk is fine here.
       - /path/to/packs:/packs
       # FP4 delta-tier pack (the unified-memory fix). Random reads at serve
-      # time (gate promotions) — put this on the INTERNAL NVMe. ~132 GiB.
+      # time (gate promotions) - put this on the INTERNAL NVMe. ~132 GiB.
       - /path/to/nvme-packs:/packs-nvme
     environment:
       # --- vLLM-Moet core ---
@@ -75,7 +75,37 @@ services:
       # that serves fine. This is the code's explicit consent valve; a real
       # shortfall still fails as a plain torch OOM.
       - VLLM_MOE_W2_FORCE_RESIDENT=1
-      # Return allocator segments eagerly — on unified memory every retained
+      # >>> THE GB10 decode fix (measured 2026-08-05): S4 spec-mask on the V2
+      # gate hook. Without it the gate evaluates ALL verify rows and fires on
+      # ~38% of steps on prose @temp=1.0 (worst max_prob is routinely <0.6 on
+      # rows the sampler DISCARDS after the first rejected draft), each fire
+      # costing up to 768 MiB of synchronous NVMe promotion reads + up to 3
+      # full re-forwards. Measured decode at tau=0.60/promote=64: 7.9 tok/s
+      # masked-off vs 14.3 tok/s masked-on - same quality semantics (masked
+      # rows never reach the sampler). Requires image >= v028 (the V2 hook
+      # plumbing shipped with the spec-mask port).
+      - VLLM_MOE_W2_GATE_SPEC_MASK=1
+      # Gate telemetry: per-fire trace + KPI every 100 steps. Cheap, and the
+      # single most valuable diagnostic on this box (the 2026-08-05 session
+      # found the 38%-fire-rate pathology from these lines).
+      - VLLM_MOE_W2_GATE_TRACE=1
+      - VLLM_MOE_W2_KPI_EVERY=100
+      # Live-tunable gate knobs (mtime-cached, re-read on change): sweep tau /
+      # promote budget on a warm server, no restarts. Start values = upstream
+      # defaults (0.60 / 64). Measured grid on GB10 with the spec-mask on:
+      #   tau=0.60/mp=64 -> 14.3 tok/s (unchanged quality semantics, DEFAULT)
+      #   tau=0.60/mp=16 -> 15.8 tok/s (cheaper fires; re-validate quality)
+      #   tau=0.30/mp=16 -> 15.9 tok/s (fires ~1% of steps; re-validate)
+      - VLLM_MOE_W2_GATE_TAU_FILE=/packs-nvme/knobs/tau.txt
+      - VLLM_MOE_W2_GATE_MAX_PROMOTE_FILE=/packs-nvme/knobs/max_promote.txt
+      # FP4 prefetch from draft affinity on a side stream (off the critical
+      # path) - pairs well with the spec-mask (fires become rare, prefetch
+      # keeps the pool warm instead).
+      - VLLM_MOE_W2_PREFETCH=1
+      # Fused unpermute (Triton): skips the fp32 zero+scatter buffers per
+      # layer per chunk. Part of the measured prefill win below.
+      - VLLM_MOE_W2_FUSED_UNPERMUTE=1
+      # Return allocator segments eagerly - on unified memory every retained
       # buffer is real silicon.
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       # --- startup hygiene: zero network = zero silent hangs ---
@@ -96,7 +126,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 120m               # first boot quantizes 277B params —
+      start_period: 120m               # first boot quantizes 277B params -
                                        #   do not let a watchdog kill it midway
     command:
       - "--model=/model"
@@ -104,19 +134,21 @@ services:
       - "deepseek-v4-flash-0731"
       - "deepseek-v4-flash-0731-think"   # second alias: per-request thinking
                                          #   toggle via chat_template_kwargs
-      # Per-request delegation by chat_template_kwargs.enable_thinking:
-      #   true  -> R1-style parser (reasoning/content split on </think>)
-      #   false -> identity (chat responses untouched)
+      # Per-request thinking via chat_template_kwargs.enable_thinking. Since
+      # v029/v030 both modes route EVERY <think> block to the `reasoning`
+      # field, wherever in the output it appears - 0731 is agent-tuned and
+      # reopens thinking mid-answer, which used to leak raw </think> to
+      # clients. VLLM_DS_V3_LEGACY_REASONING=1 restores stock behavior.
       - "--reasoning-parser=deepseek_v3"
       # Tool calling (agents, OpenAI tool_choice=auto). "deepseek_v4" is the
-      # DSML grammar of this checkpoint — name from the registry, not guessed.
+      # DSML grammar of this checkpoint - name from the registry, not guessed.
       - "--enable-auto-tool-choice"
       - "--tool-call-parser=deepseek_v4"
       - "--host=0.0.0.0"
       - "--port=8000"
       - "--trust-remote-code"
       - "--tokenizer-mode=deepseek_v4"
-      # Loader WITHOUT mmap — without this the boot does NOT pass on GB10:
+      # Loader WITHOUT mmap - without this the boot does NOT pass on GB10:
       # the default safetensors loader mmaps shards and never releases the
       # mappings; a 155 GiB checkpoint vs 121 GiB of memory wedges the box
       # around layer 17 (PSI full 75%, unkillable). The Run:ai streamer reads
@@ -137,17 +169,24 @@ services:
       - "--max-num-seqs=2"         # exactly 2: the V2 runner's sparse-MLA
                                    #   warmup schedules 2 synthetic requests;
                                    #   with 1 it dies with "No free indices".
-      - "--max-num-batched-tokens=2048"  # prefill is weight-read-bound, so the
+      - "--max-num-batched-tokens=4096"  # prefill is weight-read-bound, so the
                                          #   chunk scales ~linearly: 512 gave
-                                         #   ~250 tok/s prefill, 2048 ~2.2x that
+                                         #   ~250 tok/s prefill, 2048 ~2.2x that,
+                                         #   4096 + fused unpermute -> 753 tok/s
+                                         #   on a 23.7K prompt (2026-08-05)
       - "--no-scheduler-reserve-full-isl"
       - "--tensor-parallel-size=1"
-      # Speculative decoding: DSpark k=2 — the native 0731 drafter head.
+      # Speculative decoding: DSpark k=2 - the native 0731 drafter head.
       # MEASURED on GB10: k=2 = 9.8 tok/s; k=7 (the model card default) =
-      # 5.1 tok/s — positions 4-7 accept ~0% and seven sequential drafter
+      # 5.1 tok/s - positions 4-7 accept ~0% and seven sequential drafter
       # passes per step eat the 273 GB/s bandwidth. Do not raise k.
       # NOTE: "deepseek_mtp" does NOT work with 0731 (different head
       # architecture: main_norm/main_proj + a 3-block mtp stack).
+      # draft_sample_method MEASURED 2026-08-05: probabilistic is WORSE here
+      # (acceptance 44% vs 52% greedy - the DSpark drafter's distribution with
+      # the Markov-head bias is worse calibrated than its argmax), tok/s flat.
+      # Greedy acceptance is content-dependent: ~44-52% on prose @temp=1.0,
+      # 90-97% on code @temp=0 (accepted throughput ~15 tok/s there).
       - "--speculative-config"
       - '{"method":"dspark","num_speculative_tokens":2,"draft_sample_method":"greedy"}'
       - "--compilation-config"

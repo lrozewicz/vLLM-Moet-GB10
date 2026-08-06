@@ -2,7 +2,7 @@
 
 **Run DeepSeek-V4-Flash-0731 (304B MoE: 284B main model + 20B built-in DSpark speculator head) on a single NVIDIA GB10 box** - NVIDIA
 DGX Spark, ASUS Ascent GX10, and other GB10 systems with 121.6 GiB of unified
-memory. Measured: **~9.8 tok/s decode** with speculative decoding, **256K
+memory. Measured: **~14.3 tok/s decode** with speculative decoding, **256K
 context**, quality-recovering FP4 tier, tool calling and split reasoning for
 agent use. First boot ~35 min (one-time quantization); every boot after that
 ~10 min.
@@ -20,43 +20,28 @@ it). None of what is in this repo would exist without that work - thank you.
 If the upstream project accepts contributions again, everything here is
 offered back as patches.
 
-What upstream targets is discrete-GPU boxes (RTX PRO 6000, 5090, multi-GPU
-rigs). This fork makes the same engine work on the **GB10 unified-memory**
-platform, where several of upstream's (entirely reasonable) assumptions break
-in interesting ways - see below.
-
-## What this fork changes
-
-| # | Change | Why GB10 needs it |
-|---|---|---|
-| 1 | **sm_121 family unlock** for the SASS cubins | The kernels are hand-written sm_120 SASS. Family compatibility verified on sm_121: 80/80 cubins load, compute is **bit-identical** (`test_split_equiv` max_abs_diff = 0). |
-| 2 | **Stream-build for the mxfp4 path** (DeepSeek-V4-Flash checkpoints) | Upstream stream-builds only modelopt-NVFP4 checkpoints; the mxfp4 path staged the whole ~150 GB expert checkpoint in host RAM first. On unified memory host RAM *is* VRAM - the staging cannot fit at all. |
-| 3 | **FP4 tier host store on NVMe** (config, `VLLM_MOE_W2_STORE_DIR`) | With the delta tier on, the tier stages ~3.0 GiB/layer of **pinned** host RAM during load (~129 GiB total) - invisible next to a discrete GPU, fatal on unified memory. The pack-file store bounds it to reclaimable page cache. |
-| 4 | **Model Runner V2 hooks for the W2 path** (gate promote→re-forward fixed point, per-step tier lifecycle) | The native DSpark drafter of DS4-Flash-0731 is V2-runner-only, and upstream's W2 path rejected V2 wholesale. This port enables **speculative decoding** on 0731 (+27% decode). |
-| 5 | **DFlash-on-MLA-target support** (6 fixes: draft KV dtype, aux hidden-state layout, KV-cache grouping, …) | Lets heterogeneous GQA drafts (e.g. RedHatAI's DFlash speculators) run against MLA targets. Mechanically complete; blocked in practice on a 0731-trained speculator (see below). |
-| 6 | **Boot-guard consent valves documented for unified memory** | `torch.cuda.mem_get_info` counts page cache as "used" on GB10, so the resident-fit guard refuses configs that serve fine; `VLLM_MOE_W2_FORCE_RESIDENT=1` is measured-safe here. |
-
-Full deployment lore - every knob with the measurement behind it - lives in
-[`deploy/gb10/docker-compose.deepseek-v4-flash-0731.yml`](deploy/gb10/docker-compose.deepseek-v4-flash-0731.yml).
+Upstream targets discrete-GPU boxes; this fork makes the same engine work on
+**GB10 unified memory**, where several of its entirely reasonable assumptions
+break. What changed and why: [`docs/CHANGES-VS-UPSTREAM.md`](docs/CHANGES-VS-UPSTREAM.md).
+Per-release history: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Measured results (ASUS Ascent GX10, GB10, 121.6 GiB unified, aarch64)
 
 | metric | value |
 |---|---|
-| decode, DSpark k=2 | **~9.8 tok/s** (500-token runs; acceptance 52%, mean accept len 2.04) |
-| decode, no speculation | ~7.7–8 tok/s |
-| prefill | ~500 tok/s at chunk 2048 (28K-token prompt → TTFT ~53 s) |
+| decode, DSpark k=2 | **~14.3 tok/s** at tau=0.60/promote=64; ~15.8 with promote=16, ~16.5 ceiling with the gate quiet |
+| decode, code at temperature 0 | drafter acceptance 90-97%, accepted throughput ~15 tok/s |
+| decode, no speculation | ~7.7-8 tok/s |
+| prefill | **~753 tok/s** on a 23.7K prompt (chunk 4096 + fused unpermute) |
 | context | 256K served (KV pool ~660K tokens; model is natively 1M - the ceiling is prefill time, not memory) |
-| first boot | ~35 min (43-layer streaming requant + pack writes) |
-| later boots | **~10 min** (LOADER-SKIP from the planes cache: zero staging, zero requant) |
-| memory at serve | ~117/121.6 GiB used, PSI ≈ 0 |
+| first boot / later boots | ~35 min / **~10 min** (LOADER-SKIP from the planes cache: zero staging, zero requant) |
+| memory at serve | ~117/121.6 GiB used, PSI ~ 0 |
 
-Anti-recommendations (measured, resist the urge):
-- **DSpark k=7** (the model card's suggestion): 5.1 tok/s - positions 4–7
-  accept ~0% and seven sequential drafter passes eat the 273 GB/s bandwidth.
-  k=2 is the optimum on this hardware.
-- **`deepseek_mtp` method**: incompatible with 0731's head architecture
-  (`main_norm`/`main_proj`, 3-block `mtp.{0,1,2}` stack) - fails at weight load.
+Anti-recommendations (measured, resist the urge): **DSpark k=7** (the model
+card's suggestion) gives 5.1 tok/s, because positions 4-7 accept ~0% and
+seven sequential drafter passes eat the 273 GB/s of bandwidth - k=2 is the
+optimum here. **`deepseek_mtp`** is incompatible with the 0731 head
+architecture and fails at weight load.
 
 ## Quick start
 
@@ -112,7 +97,9 @@ curl -s http://localhost:8000/v1/chat/completions \
   `chat_template_kwargs: {"enable_thinking": true|false}`; with
   `--reasoning-parser=deepseek_v3` the chain of thought comes back in the
   message's `reasoning` field (note: `reasoning`, not `reasoning_content`),
-  cleanly separated from `content`.
+  cleanly separated from `content`. This fork routes **every** `<think>`
+  block there, including ones the model reopens mid-answer, so agent clients
+  never see a raw `</think>` in the text.
 - Tool calling works out of the box (`--enable-auto-tool-choice
   --tool-call-parser=deepseek_v4` - the DSML grammar of this checkpoint).
 - Sampling per the model card: `temperature=1.0`, `top_p=0.95` for agentic
@@ -128,7 +115,7 @@ Things that are true on GB10 and surprising coming from discrete GPUs:
 1. **`MemAvailable` is not a danger signal.** It can read 0 while the machine
    is healthy and healthy while the machine is livelocked. Watch
    `/proc/pressure/memory` (`full` line) and log progress instead.
-2. **`Shmem` ≈ GPU allocation.** `cudaMalloc` is backed by shmem; after
+2. **`Shmem` is GPU allocation.** `cudaMalloc` is backed by shmem; after
    stopping the container `Shmem` drops to ~0. `drop_caches` frees nothing of
    it, swap does not touch it.
 3. **Pinned host memory is a silent killer.** Anything a discrete-GPU design
@@ -146,13 +133,12 @@ Things that are true on GB10 and surprising coming from discrete GPUs:
 [RedHatAI/DeepSeek-V4-Flash-speculator.dflash](https://huggingface.co/RedHatAI/DeepSeek-V4-Flash-speculator.dflash)
 is a 2B parallel-drafting speculator with excellent numbers on its target.
 This fork contains the complete runtime support for running it against an MLA
-target (six fixes, from draft KV-cache dtype to KV-cache grouping) - it boots,
-drafts and serves. However, the published speculator was trained against
-**base** `deepseek-ai/DeepSeek-V4-Flash`, whose weights differ from `-0731`
-(different shard hashes), and draft acceptance collapses from 41.6% to ~3%.
-The moment a 0731-trained DFlash speculator exists, this stack should hit
-~2× the current decode. If you have the training capacity - the runtime is
-ready and we will gladly test.
+target - it boots, drafts and serves. However, the published speculator was
+trained against **base** `deepseek-ai/DeepSeek-V4-Flash`, whose weights differ
+from `-0731`, and draft acceptance collapses from 41.6% to ~3%. The moment a
+0731-trained DFlash speculator exists, this stack should hit ~2x the current
+decode. If you have the training capacity - the runtime is ready and we will
+gladly test.
 
 ## Roadmap
 
@@ -168,6 +154,8 @@ ready and we will gladly test.
   preflight checks, checkpoint downloader.
 - `kernels/cubins-sm120/` - upstream's hand-written SASS kernels (run
   bit-identically on sm_121).
+- `CHANGELOG.md`, `docs/CHANGES-VS-UPSTREAM.md` - per-release history and the
+  full delta against upstream, with the measurements behind each item.
 - `docs/UPSTREAM-README.md` - the original upstream README (worth reading:
   the architecture and the quality methodology are described there).
 

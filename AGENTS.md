@@ -31,6 +31,20 @@ WILL be erased by somebody's next regeneration.
 experiments live in worktrees off the same clone
 (`git -C /workspace/vllm-v0.24.0 worktree list`).
 
+**This repo is not self-contained for vLLM code.** It carries no `vllm/`
+tree: every runtime change exists here only as the generated
+`patch/vllm-moet-v0.24.0.patch`, which the Dockerfile applies on top of the
+official `vllm/vllm-openai:v0.24.0` image. Builds and CI therefore need
+nothing but this repo - the clone is required only to *regenerate* the patch
+(and to byte-verify it).
+
+On a checkout that is not the `/workspace` box, keep the clone **next to
+this repo** - `<project>/vllm-v0.24.0` alongside `<project>/vLLM-Moet-GB10`
+- and `tools/check_patch_files.py` finds it with no configuration
+(`FORK_CANDIDATES`). `VLLM_MOET_FORK=<path>` overrides the search anywhere
+else. With no clone in reach the tool still checks the file list but skips
+byte-verify, and says so.
+
 `moet-v0.24.0` is the ship lineage: everything committed there is meant to
 ship in the next patch regen. Park half-done work on a side branch or
 worktree, not on `moet-v0.24.0`.

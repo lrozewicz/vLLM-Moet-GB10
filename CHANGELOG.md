@@ -11,6 +11,32 @@ Numbers are measured on the reference box: ASUS Ascent GX10 (GB10, 48 SM,
 The what-and-why of each change against upstream is in
 [`docs/CHANGES-VS-UPSTREAM.md`](docs/CHANGES-VS-UPSTREAM.md).
 
+## Unreleased
+
+### Fixed
+
+- **DFlash aux hidden states were a no-op flatten.** The DFlash branch fed
+  drafts `hidden_states.flatten(1)`, but between decoder layers
+  `hidden_states` is the single-stream `x` returned by
+  `mhc_fused_post_pre_tilelang` - 2-D `[T, hidden]`, so the flatten did
+  nothing and the drafter received `n_aux x hidden` (5 x 4096 = 20480)
+  features where a DFlash fc wants `n_aux x hc_mult x hidden` (81920). The
+  streams only exist as `aux_recon` `[T, hc_mult, hidden]`; flatten that
+  instead. Both assembly paths concatenate the aux list as-is
+  (`gpu_model_runner.py`, `spec_decode/dflash/speculator.py`) and
+  `llm_base_proposer` asserts the combined width, so on images `v026`-`v031`
+  a DFlash boot against this target could not run at all.
+
+### Changed
+
+- The DFlash acceptance figure is now reported per workload. Measured on
+  `-0731` at k=7 with the fix above: **11.8%** on code at greedy (position 1
+  **45.7%**, 1.82 accepted tokens/step) and **2.7%** on prose at temperature
+  1.0. The previously published "~3%" was the prose number alone and
+  understates the published checkpoint by roughly 4x; the conclusion is
+  unchanged (it does not transfer to `-0731`; base target: 41.6% / 78.8% /
+  3.9), but the starting point for a fine-tune is better than recorded.
+
 ## v0.2.1 - 2026-08-08
 
 Image `v031`.

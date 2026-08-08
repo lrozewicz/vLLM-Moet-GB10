@@ -11340,7 +11340,7 @@ index 0000000..be4a87b
 +            return f"model.{rest}"
 +        return f"model.layers.{stage}.{rest}"
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index aa60ad3..45367e9 100644
+index aa60ad3..789b685 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -46,7 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -11410,7 +11410,7 @@ index aa60ad3..45367e9 100644
              hidden_states, residual, post_mix, res_mix = layer(
                  hidden_states,
                  positions,
-@@ -1067,17 +1091,35 @@ class DeepseekV4Model(nn.Module):
+@@ -1067,17 +1091,39 @@ class DeepseekV4Model(nn.Module):
                  res_mix,
                  residual,
              )
@@ -11420,10 +11420,14 @@ index aa60ad3..45367e9 100644
 +                    hidden_states, residual, post_mix, res_mix
 +                )
 +                if self._aux_flatten_hc:
-+                    # DFlash drafts ("multi-stream hidden states"): the RAW
-+                    # residual streams, flattened [T, hc_mult*hidden] — not
-+                    # the mhc_post reconstruction.
-+                    aux_hidden_states.append(hidden_states.flatten(1))
++                    # DFlash drafts ("multi-stream hidden states") consume all
++                    # hc_mult streams flattened to [T, hc_mult*hidden]. Must
++                    # read aux_recon, not hidden_states: between decoder layers
++                    # hidden_states is the single-stream `x` from
++                    # mhc_fused_post_pre_tilelang, i.e. 2-D [T, hidden], so
++                    # .flatten(1) on it is a no-op (measured: 5 x 4096 = 20480
++                    # features into a DFlash fc that wants 5 x hc_mult x 4096).
++                    aux_hidden_states.append(aux_recon.flatten(1))
 +                else:
 +                    aux_hidden_states.append(aux_recon.mean(dim=1))
 +                final_aux_recon = aux_recon
@@ -11452,7 +11456,7 @@ index aa60ad3..45367e9 100644
  
          hidden_states = hc_head_fused_kernel_tilelang(
              hidden_states,
-@@ -1088,6 +1130,8 @@ class DeepseekV4Model(nn.Module):
+@@ -1088,6 +1134,8 @@ class DeepseekV4Model(nn.Module):
              self.hc_eps,
          )
          hidden_states = self.norm(hidden_states)
@@ -11461,7 +11465,7 @@ index aa60ad3..45367e9 100644
          return hidden_states
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-@@ -1314,7 +1358,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
+@@ -1314,7 +1362,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
              moe.experts.update_expert_map()
  
  

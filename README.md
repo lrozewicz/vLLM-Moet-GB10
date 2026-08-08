@@ -135,10 +135,16 @@ is a 2B parallel-drafting speculator with excellent numbers on its target.
 This fork contains the complete runtime support for running it against an MLA
 target - it boots, drafts and serves. However, the published speculator was
 trained against **base** `deepseek-ai/DeepSeek-V4-Flash`, whose weights differ
-from `-0731`, and draft acceptance collapses from 41.6% to ~3%. The moment a
-0731-trained DFlash speculator exists, this stack should hit ~2x the current
-decode. If you have the training capacity - the runtime is ready and we will
-gladly test.
+from `-0731`, and acceptance does not transfer: measured on 0731 at k=7,
+**11.8%** on code at greedy (position 1: 45.7%, 1.82 accepted tokens/step) and
+**2.7%** on prose at temperature 1.0, against 41.6% / 78.8% / 3.9 on the base
+target. Two integration notes for anyone reproducing this: the published
+`config.json` leaves `target_hidden_size` at `null` (it needs `16384` for
+`hc_mult=4`, otherwise the fc is sized for a quarter of its input), and
+acceptance is strongly workload-dependent, so a single prose-at-temperature-1
+number understates the checkpoint by ~4x. The moment a 0731-trained DFlash
+speculator exists, this stack should hit ~2x the current decode. If you have
+the training capacity - the runtime is ready and we will gladly test.
 
 ## Roadmap
 

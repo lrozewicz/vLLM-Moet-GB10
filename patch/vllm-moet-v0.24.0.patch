@@ -1,9 +1,9 @@
 diff --git a/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 new file mode 100644
-index 0000000..c4b64f2
+index 0000000..3ef3adc
 --- /dev/null
 +++ b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,172 @@
 +// concat_and_cache_nvfp4_ds_mla: write the MLA latent + rope into the packed
 +// nvfp4_ds_mla KV cache layout (352 B/token):
 +//
@@ -22,7 +22,8 @@ index 0000000..c4b64f2
 +//
 +// Built as a standalone torch extension for now (see
 +// vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py); proper _C
-+// integration is a follow-up. Requires sm_120a (cvt e2m1x2).
++// integration is a follow-up. Requires an arch-specific target - sm_120a or
++// sm_121a (cvt e2m1x2).
 +
 +#include <torch/extension.h>
 +#include <c10/cuda/CUDAGuard.h>
@@ -1669,7 +1670,7 @@ index de505e1..f0b49e2 100644
          return self.num_speculative_tokens_per_batch_size is not None
  
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index ba7d26c..55e8dda 100644
+index ba7d26c..678b461 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -524,6 +524,16 @@ class VllmConfig:
@@ -1761,7 +1762,7 @@ index ba7d26c..55e8dda 100644
              ):
                  unsupported.append("parallel drafting for EAGLE speculative decoding")
  
-@@ -2161,12 +2194,28 @@ class VllmConfig:
+@@ -2161,12 +2194,34 @@ class VllmConfig:
      def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
          if self.model_config is None:
              return self
@@ -1778,17 +1779,23 @@ index ba7d26c..55e8dda 100644
 +                and self.model_config.use_mla):
 +            cap = current_platform.get_device_capability()
 +            text_config = self.model_config.hf_text_config
++            # DeepseekV4 configs carry no kv_lora_rank; the cached latent
++            # width is head_dim (rope is a separate 64-wide k_pe, same
++            # 512+64 cache line as V3 — see fp8_ds_mla's 656 B layout).
++            latent_dim = getattr(text_config, "kv_lora_rank", None)
++            if (latent_dim is None
++                    and getattr(text_config, "model_type", "") == "deepseek_v4"):
++                latent_dim = getattr(text_config, "head_dim", None)
 +            geometry_ok = (
-+                getattr(text_config, "kv_lora_rank", None) == 512
++                latent_dim == 512
 +                and getattr(text_config, "qk_rope_head_dim", None) == 64
              )
-+            if (cap is None or (cap.major, cap.minor) != (12, 0)
++            if (cap is None or (cap.major, cap.minor) not in ((12, 0), (12, 1))
 +                    or not geometry_ok):
 +                raise ValueError(
-+                    "packed nvfp4 MLA KV cache requires exactly SM120 and "
++                    "packed nvfp4 MLA KV cache requires SM120/SM121 and "
 +                    "the validated latent/rope geometry 512/64; got "
-+                    f"capability={cap}, kv_lora_rank="
-+                    f"{getattr(text_config, 'kv_lora_rank', None)}, "
++                    f"capability={cap}, latent_dim={latent_dim}, "
 +                    f"qk_rope_head_dim="
 +                    f"{getattr(text_config, 'qk_rope_head_dim', None)}. "
 +                    "Use --kv-cache-dtype fp8 or auto.")
@@ -13496,20 +13503,24 @@ index 0bc7ca7..ae31f01 100644
              seq_start + seq_len_per_token,
 diff --git a/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 new file mode 100644
-index 0000000..858c4d2
+index 0000000..e02dd0e
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,79 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Loader for the nvfp4_ds_mla KV cache write kernel.
 +
 +The kernel lives in csrc/nvfp4_ds_mla/ and is built as a standalone torch
-+extension on first use (sm_120a only). Proper vllm._C integration is a
-+follow-up; this keeps the initial change self-contained.
++extension on first use, targeting the local device (validated: sm_120a and
++sm_121a; cvt e2m1x2 is arch-specific, so the `a` suffix is mandatory).
++Proper vllm._C integration is a follow-up; this keeps the initial change
++self-contained.
 +
 +Set VLLM_NVFP4_DS_MLA_EXT_DIR to point at a prebuilt extension directory
-+(e.g. baked into a docker image) to skip the JIT build.
++(e.g. baked into a docker image) to skip the JIT build, or
++VLLM_NVFP4_DS_MLA_ARCHS (e.g. "120a;121a") to build a fatbin for explicit
++archs - that is how an image bakes the extension without a GPU present.
 +"""
 +import functools
 +import glob
@@ -13518,6 +13529,19 @@ index 0000000..858c4d2
 +import pathlib
 +
 +import torch  # noqa: F401  (loads libc10/libtorch before the .so)
++
++SUPPORTED_CAPS = ((12, 0), (12, 1))
++
++
++def _arch_flags() -> list[str]:
++    archs = os.environ.get("VLLM_NVFP4_DS_MLA_ARCHS", "")
++    if not archs:
++        cap = torch.cuda.get_device_capability()
++        archs = f"{cap[0]}{cap[1]}a"
++    return [
++        f"--generate-code=arch=compute_{a},code=sm_{a}"
++        for a in archs.split(";") if a
++    ]
 +
 +
 +@functools.cache
@@ -13543,9 +13567,7 @@ index 0000000..858c4d2
 +    return load(
 +        name="nvfp4_ds_mla_cache_ext",
 +        sources=[str(src)],
-+        extra_cuda_cflags=[
-+            "-O3", "--generate-code=arch=compute_120a,code=sm_120a"
-+        ],
++        extra_cuda_cflags=["-O3", *_arch_flags()],
 +    )
 +
 +
@@ -13558,9 +13580,9 @@ index 0000000..858c4d2
 +    if not kv_c_normed.is_cuda:
 +        raise RuntimeError("nvfp4_ds_mla cache input must be CUDA")
 +    cap = torch.cuda.get_device_capability(kv_c_normed.device)
-+    if cap != (12, 0):
++    if cap not in SUPPORTED_CAPS:
 +        raise RuntimeError(
-+            "nvfp4_ds_mla cache extension requires exactly SM120 on the "
++            "nvfp4_ds_mla cache extension requires SM120 or SM121 on the "
 +            f"input tensor device; got {cap} on {kv_c_normed.device}")
 +    _ext().concat_and_cache_nvfp4_ds_mla(kv_c_normed, k_pe, kv_cache,
 +                                         slot_mapping)

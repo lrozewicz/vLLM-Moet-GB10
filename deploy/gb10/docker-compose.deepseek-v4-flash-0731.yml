@@ -156,8 +156,13 @@ services:
       - "--load-format=runai_streamer"
       - "--model-loader-extra-config"
       - '{"concurrency": 2, "memory_limit": 2147483648}'
-      # fp8 KV REQUIRED: the nvfp4 KV path is compiled sm_120a (device-specific)
-      # and cannot start on sm_121.
+      # NOTE on "--kv-cache-dtype=nvfp4": NOT supported for DeepseekV4. The
+      # fork's packed-nvfp4 path (write kernel + FlashInfer read patch) is
+      # wired into the generic FLASHINFER_MLA_SPARSE_SM120 backend and its
+      # 512/64 (352 B/token) V3.2 cache line; the V4 model classes use their
+      # own 448/64 fp8_ds_mla layout (584 B/token) with no nvfp4 variant.
+      # Adding one would be kernel work for a capacity-only win the GB10
+      # doesn't need (KV usage ~1.5% in benches, needle 128K passes).
       - "--kv-cache-dtype=fp8"
       - "--block-size=256"
       - "--max-model-len=262144"   # 256K. KV is cheap on DS4 (MLA + the

@@ -17,10 +17,18 @@
 #   4. sm_120 cubins installed to /cubit-share (family-compatible with sm_121:
 #      verified bit-identical compute, see README).
 #
-# What it deliberately does NOT build: the NVFP4 KV-cache extension. That step
-# compiles with `arch=compute_120a,code=sm_120a` — the `a` suffix means
-# device-SPECIFIC, not family — so it cannot start on sm_121. Serve with
-# `--kv-cache-dtype=fp8` (as all DS4 recipes in the upstream repo do).
+#   5. The NVFP4 KV-cache path (`--kv-cache-dtype=nvfp4`, 352 B/token instead
+#      of 656): the write extension prebuilt as a fatbin for sm_120a AND
+#      sm_121a (the `a` suffix means device-SPECIFIC, not family — the stock
+#      sm_120a-only build cannot start on sm_121), and FlashInfer's sparse-MLA
+#      JIT sources patched with the packed-layout read side
+#      (tools/nvfp4_flashinfer_sm120/patch_flashinfer.py). NOTE: if /root/.cache
+#      is a persisted volume from a pre-nvfp4 image, clear its flashinfer JIT
+#      dir once so the kernels recompile from the patched sources.
+#      CAVEAT: this path serves the generic FLASHINFER_MLA_SPARSE_SM120
+#      backend (V3.2-family, 512/64 cache line). DeepseekV4 models use their
+#      own 448/64 fp8_ds_mla layout and have NO nvfp4 variant — keep
+#      `--kv-cache-dtype=fp8` for DS4-Flash (see the 0731 compose).
 
 ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
 
@@ -89,6 +97,21 @@ RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vll
     && python3 -c "import vllm.v1.worker.gpu.spec_decode.dspark.speculator; print('dspark OK')" \
     && python3 -c "import vllm.v1.worker.gpu.spec_decode.dflash.speculator; print('dflash OK')" \
     && rm /tmp/vllm-moet.patch
+
+# --- 3b. NVFP4 KV cache, read side: patch FlashInfer's sparse-MLA JIT
+#         sources (idempotent, hard-anchored; the JIT recompiles from the
+#         patched sources at first use). The patcher ships inside the vLLM
+#         patch applied above.
+RUN SP="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+    && python3 "$SP/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py"
+
+# --- 3c. NVFP4 KV cache, write side: prebuild the concat_and_cache extension
+#         as a fatbin for both validated archs (no GPU at build time, so the
+#         arch list is explicit). The serving path picks it up via
+#         VLLM_NVFP4_DS_MLA_EXT_DIR and skips the boot-time JIT.
+RUN TORCH_EXTENSIONS_DIR=/opt/nvfp4-ext VLLM_NVFP4_DS_MLA_ARCHS="120a;121a" \
+    python3 -c "from vllm.v1.attention.backends.mla.nvfp4_ds_mla_cache import _ext; _ext(); print('nvfp4_ds_mla ext prebuilt')"
+ENV VLLM_NVFP4_DS_MLA_EXT_DIR=/opt/nvfp4-ext
 
 # --- 4. sm_120 cubins (family-compatible with sm_121)
 COPY kernels/cubins-sm120/ /cubit-share/

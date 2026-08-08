@@ -11,6 +11,41 @@ Numbers are measured on the reference box: ASUS Ascent GX10 (GB10, 48 SM,
 The what-and-why of each change against upstream is in
 [`docs/CHANGES-VS-UPSTREAM.md`](docs/CHANGES-VS-UPSTREAM.md).
 
+## v0.2.1 - 2026-08-08
+
+Image `v031`.
+
+### Added
+
+- The NVFP4 KV write extension now JIT-compiles for the **local** device
+  capability instead of hardcoded sm_120a (the `a` suffix is device-specific,
+  not family-compatible, so the stock build could not even load on sm_121).
+  `VLLM_NVFP4_DS_MLA_ARCHS` (e.g. `"120a;121a"`) prebuilds a fatbin on a
+  machine without a GPU - the Dockerfile uses it.
+- Dockerfile: new step 3b applies the FlashInfer read-side patch
+  (`tools/nvfp4_flashinfer_sm120/patch_flashinfer.py`) - earlier images never
+  ran it, so the packed read path was silently absent; step 3c prebuilds the
+  write extension for sm_120a+sm_121a into `VLLM_NVFP4_DS_MLA_EXT_DIR`.
+
+### Fixed
+
+- The nvfp4 KV config validator rejected every real DeepseekV4 checkpoint on
+  every GPU: it read `kv_lora_rank`, which V4 configs do not define (the
+  cached latent width is `head_dim`). It now falls back to `head_dim` for
+  `model_type=deepseek_v4`. Nobody had hit this before because the sm_120a
+  capability gate above it fired first.
+
+### Known limitation
+
+- `--kv-cache-dtype=nvfp4` does **not** cover DeepseekV4 models. The packed
+  nvfp4 path (write kernel + FlashInfer read patch) serves the generic
+  `FLASHINFER_MLA_SPARSE_SM120` backend and its 512/64 cache line (V3.2
+  family, 656 -> 352 B/token). V4 model classes use their own 448/64
+  `fp8_ds_mla` layout (584 B/token) and have no nvfp4 variant; adding one
+  would be new kernel work for a capacity-only win. The reference compose
+  stays on `--kv-cache-dtype=fp8`; caveats are documented in the Dockerfile
+  header and the 0731 compose.
+
 ## v0.2.0 - 2026-08-06
 
 Images `v028` (decode), `v029` and `v030` (reasoning output).

@@ -29,6 +29,23 @@ The what-and-why of each change against upstream is in
 
 ### Changed
 
+- **Gate operating point settled: tau=0.60 / promote=64 stays the default.** Both
+  endpoints of the 2026-08-05 sweep ran the full quality suite. No significant
+  difference on HumanEval (93.9 vs 92.1, flips 4/1, McNemar p=0.375), HumanEval+
+  (90.2 vs 87.8, 6/2, p=0.289), MBPP (89.7 vs 89.7, 4/4, p=1.000), MBPP+ (73.5 vs
+  73.0, 10/8, p=0.815), BFCL lite (89.3 vs 88.3) or needle (100 vs 100); GPQA
+  Diamond is incomplete for the pair. Throughput re-measured 2026-08-09 across
+  three workloads, because the gate's cost is a property of the traffic: sampled
+  prose pays 18% in Polish (12.8 vs 15.6 tok/s, fires 11.8% of steps) and 26% in
+  English (12.9 vs 17.5, fires 13.9%), but **on code at temperature 0 the safe
+  point costs 4%** (21.7 vs 22.6, fires 2.3% of steps vs 0.2%) - greedy code
+  decoding is confident, so the safety net rarely triggers wherever tau sits.
+  (At 0.60/64 both prose languages collapse to ~12.9 tok/s: once the gate fires
+  on one step in seven, it is the bottleneck.) Agentic coding is what this box serves, so
+  we keep the protective point: a few percent does not buy a risk that short
+  single-turn suites cannot resolve, and long sessions and hard multi-step
+  programming - where uncertainty compounds - are unmeasured. The knobs stay
+  live-tunable. Rationale: `docs/quality.md`.
 - The DFlash acceptance figure is now reported per workload. Measured on
   `-0731` at k=7 with the fix above: **11.8%** on code at greedy (position 1
   **45.7%**, 1.82 accepted tokens/step) and **2.7%** on prose at temperature

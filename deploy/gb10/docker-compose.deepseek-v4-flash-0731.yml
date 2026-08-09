@@ -94,8 +94,17 @@ services:
       # promote budget on a warm server, no restarts. Start values = upstream
       # defaults (0.60 / 64). Measured grid on GB10 with the spec-mask on:
       #   tau=0.60/mp=64 -> 14.3 tok/s (unchanged quality semantics, DEFAULT)
-      #   tau=0.60/mp=16 -> 15.8 tok/s (cheaper fires; re-validate quality)
-      #   tau=0.30/mp=16 -> 15.9 tok/s (fires ~1% of steps; re-validate)
+      #   tau=0.60/mp=16 -> 15.8 tok/s (cheaper fires)
+      #   tau=0.30/mp=16 -> 15.9 tok/s (fires ~2% of steps)
+      # 0.60/64 is a DELIBERATE default, not an unswept one. Both endpoints ran
+      # the full quality suite (2026-08-05..08): HumanEval/MBPP/BFCL/needle show
+      # no significant difference (McNemar p >= 0.29, MBPP flips symmetric), and
+      # the one suite sensitive to promotion policy (GPQA Diamond) never finished
+      # for this pair. The grid above is the gate's WORST case (sampled prose:
+      # fires 11.8% of steps in PL, 13.9% in EN, costing 18% / 26%); on code @
+      # temp 0 it fires 2.3% of steps and the two points measure 21.7 vs 22.6
+      # tok/s - keeping the safe one costs ~4% on the traffic this box serves.
+      # Serving mostly chat prose? Re-weigh. Numbers: docs/quality.md.
       - VLLM_MOE_W2_GATE_TAU_FILE=/packs-nvme/knobs/tau.txt
       - VLLM_MOE_W2_GATE_MAX_PROMOTE_FILE=/packs-nvme/knobs/max_promote.txt
       # FP4 prefetch from draft affinity on a side stream (off the critical

@@ -29,7 +29,7 @@ Per-release history: [`CHANGELOG.md`](CHANGELOG.md).
 
 | metric | value |
 |---|---|
-| decode, DSpark k=2 | **~14.3 tok/s** at tau=0.60/promote=64; ~15.8 with promote=16, ~16.5 ceiling with the gate quiet |
+| decode, DSpark k=2 | **~14.3 tok/s** at tau=0.60/promote=64 (the shipped default, [deliberately](docs/quality.md#gate-operating-point-why-we-stay-at-tau060--promote64)); ~15.8 with promote=16, ~16.5 ceiling with the gate quiet |
 | decode, code at temperature 0 | drafter acceptance 90-97%, accepted throughput ~15 tok/s |
 | decode, no speculation | ~7.7-8 tok/s |
 | prefill | **~753 tok/s** on a 23.7K prompt (chunk 4096 + fused unpermute) |

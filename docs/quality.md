@@ -79,6 +79,85 @@ instrumentation) in ~1 s without loading the model. Questions this makes answera
 These are open questions the design invites; the README tables are the headline, this is the
 instrumentation to push further.
 
+## Gate operating point: why we stay at tau=0.60 / promote=64
+
+The confidence gate has two live knobs (see the compose comments for the file-based
+override). `tau` decides **when** the safety net fires: the gate takes the `max_prob` of the
+least-confident row the sampler can actually emit and fires when it drops to `tau` or below —
+the step is then re-decided with its routed experts upgraded from 2-bit to FP4.
+`max_promote` decides **how much** each fire upgrades: a cap on the (layer, expert) pairs
+pulled up per fired step, most-needed first.
+
+Lowering both makes the gate cheaper: fewer steps trigger it, and each trigger upgrades less.
+The question is what that buys, and what it costs — and both answers turned out to depend on
+the workload.
+
+**Throughput — and it depends entirely on the workload** (GB10, image `v031`, spec-mask on,
+500-token runs, 2026-08-09). `tau` thresholds *confidence*, so how often the gate fires — and
+therefore what it costs — is a property of the traffic, not of the setting alone:
+
+| workload | fires at tau=0.60 | tau=0.60 / mp=64 | tau=0.30 / mp=16 | cost of the safe point |
+|---|---|---|---|---|
+| code, temperature 0 | 2.3% of steps | 21.7 tok/s (n=3, 20.7–22.9) | 22.6 (n=3, 21.3–23.7) | −0.8 tok/s (**−4%**) |
+| prose (PL), temperature 1.0 | 11.8% of steps | 12.8 tok/s (n=11, 10.7–14.5) | 15.6 (n=8, 13.5–16.4) | −2.8 tok/s (**−18%**) |
+| prose (EN), temperature 1.0 | 13.9% of steps | 12.9 tok/s (n=3, 11.9–13.9) | 17.5 (n=3, 16.7–18.0) | −4.5 tok/s (**−26%**) |
+
+**On the workload this box actually serves — agentic coding — the protective setting costs
+about 4%,** and the two points are barely separable given the run-to-run spread. Greedy
+decoding on code is confident, so the safety net almost never triggers no matter where `tau`
+sits (2.3% of steps at 0.60, 0.2% at 0.30).
+
+On sampled prose the penalty is real and larger than we first measured: 18% in Polish, 26% in
+English. Note what the numbers do at the two points — at 0.30/16 English runs clearly faster
+than Polish (17.5 vs 15.6 tok/s), but at 0.60/64 both collapse to ~12.9. Once the gate fires on
+one step in seven it *is* the bottleneck, and whatever the language was worth disappears into
+it. Chat-style prose is the Open WebUI path here, not the primary one, but anyone serving that
+traffic should weigh 0.30/16 on its own merits.
+
+Two measurement notes. The sweep's original "~38% of steps fire" for prose predates the
+spec-mask (v028); with the mask the same point measures 11.8% — that change is exactly why
+throughput moved 7.9 → 14.3. And a pool left cold for the gate (14 h served at tau=0.30)
+starts near 12.4 tok/s and climbs to ~13.5 as fires warm it: measure warm.
+
+Recorded at sweep time for reference: 14.3 tok/s at 0.60/64, 15.8 at 0.60/16, 15.9 at 0.30/16,
+16.5 with the gate quiet (tau=0), all on the prose prompt.
+
+**Quality**, full suite at both points (`bench-compare`, `results/moet` = 0.60/64,
+`results/moet-tau030` = 0.30/16, temperature 0):
+
+| | 0.60 / 64 | 0.30 / 16 | flips (down/up) | McNemar |
+|---|---|---|---|---|
+| HumanEval (164) | 93.9% | 92.1% | 4 / 1 | p=0.375 |
+| HumanEval+ (164) | 90.2% | 87.8% | 6 / 2 | p=0.289 |
+| MBPP (378) | 89.7% | 89.7% | 4 / 4 | p=1.000 |
+| MBPP+ (378) | 73.5% | 73.0% | 10 / 8 | p=0.815 |
+| BFCL lite (300) | 89.3% | 88.3% | — | — |
+| needle (40) | 100% | 100% | 0 / 0 | — |
+| GPQA Diamond | **incomplete** | **incomplete** | — | — |
+
+**No individual result is significant.** MBPP flips are symmetric (4↔4, 10↔8) — single-task
+instability, not regression. HumanEval leans down (4:1, 6:2) but at p≈0.3 that is not a signal.
+
+**We ship 0.60/64.** On the traffic this box serves the safe point costs ~4%, and even the
+worst-case 26% would not buy a quality risk this suite cannot resolve, for three reasons:
+
+1. **The suites that came back clean are the short ones.** HumanEval, MBPP and BFCL are
+   single-turn tasks of a few hundred tokens. The gate protects *uncertain* tokens, and
+   uncertainty compounds over long sessions and hard multi-step programming work — exactly the
+   regime none of these measure.
+2. **The one suite that is sensitive here never finished.** GPQA Diamond is where promotion
+   policy already showed a real effect (uncapped vs capped: 60.6% vs 70.2%, McNemar p=0.002 —
+   see above). Its top-up run for this pair was interrupted, so the pair is unresolved precisely
+   where it matters most.
+3. **The knobs trade recall, and that is measurable in principle.** At tau=0.60 the gate catches
+   roughly two thirds of the cases where FP4 would have decided a token differently than 2-bit.
+   Dropping to 0.30 hands the 0.30–0.60 confidence band back to 2-bit. "No visible loss on short
+   coding tasks" is not the same as "no loss".
+
+If someone wants the faster point, the knobs are live-tunable with no restart (write `0.30` and
+`16` to the knob files); this is a defaults decision, not a capability limit. Reopen it when the
+GPQA pair is complete.
+
 ## Reproduce
 ```bash
 # Native reference collection (internal baseline recipe, pinned model/context)

@@ -55,7 +55,11 @@ steps at temperature 1.0 - on uncertainty in rows the sampler *discards*
 after the first rejected draft. Each fire costs up to 768 MiB of synchronous
 NVMe promotion reads plus up to 3 full re-forwards. With the mask the quality
 semantics are unchanged (masked rows never reach the sampler) and decode goes
-**7.9 -> 14.3 tok/s** at tau=0.60/promote=64.
+**7.9 -> 14.3 tok/s** at tau=0.60/promote=64. (Both figures are the prose
+prompt, the gate's worst case. The mask is also what took the fire rate on
+that prompt from ~38% to ~12%; on code at temperature 0 the gate fires on
+2-4% of steps and the same point serves ~21 tok/s - see
+[`docs/quality.md`](quality.md#gate-operating-point-why-we-stay-at-tau060--promote64).)
 
 **7. DFlash-on-MLA-target support** (draft KV dtype, aux hidden-state layout,
 layer-scoped attention guard, hidden buffer widths, KV-cache grouping). Lets

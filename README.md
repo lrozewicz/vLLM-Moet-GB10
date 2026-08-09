@@ -2,10 +2,10 @@
 
 **Run DeepSeek-V4-Flash-0731 (304B MoE: 284B main model + 20B built-in DSpark speculator head) on a single NVIDIA GB10 box** - NVIDIA
 DGX Spark, ASUS Ascent GX10, and other GB10 systems with 121.6 GiB of unified
-memory. Measured: **~14.3 tok/s decode** with speculative decoding, **256K
-context**, quality-recovering FP4 tier, tool calling and split reasoning for
-agent use. First boot ~35 min (one-time quantization); every boot after that
-~10 min.
+memory. Measured: **~21 tok/s decode on code**, ~13 on sampled prose (the gap
+is how often the speculator guesses right), **256K context**, quality-recovering
+FP4 tier, tool calling and split reasoning for agent use. First boot ~35 min
+(one-time quantization); every boot after that ~10 min.
 
 ## Credit where credit is due
 
@@ -29,8 +29,9 @@ Per-release history: [`CHANGELOG.md`](CHANGELOG.md).
 
 | metric | value |
 |---|---|
-| decode, DSpark k=2 | **~14.3 tok/s** at tau=0.60/promote=64 (the shipped default, [deliberately](docs/quality.md#gate-operating-point-why-we-stay-at-tau060--promote64)); ~15.8 with promote=16, ~16.5 ceiling with the gate quiet |
-| decode, code at temperature 0 | drafter acceptance 90-97%, accepted throughput ~15 tok/s |
+| decode, code at temperature 0 (DSpark k=2) | **~21 tok/s** (n=6, 20.5-22.9); drafter acceptance 81%, 2.62 accepted tokens/step; the confidence gate fires on 2-4% of steps |
+| decode, sampled prose at temperature 1.0 | **~12.9 tok/s** (PL 12.8, EN 12.9); the gate fires on 12-14% of steps - its worst case, and what the tuning grid below was swept on |
+| decode, gate operating point | shipped default is tau=0.60/promote=64, [deliberately](docs/quality.md#gate-operating-point-why-we-stay-at-tau060--promote64); the cheap point (0.30/16) buys 22.6 tok/s on code and 15.6 PL / 17.5 EN on prose |
 | decode, no speculation | ~7.7-8 tok/s |
 | prefill | **~753 tok/s** on a 23.7K prompt (chunk 4096 + fused unpermute) |
 | context | 256K served (KV pool ~660K tokens; model is natively 1M - the ceiling is prefill time, not memory) |

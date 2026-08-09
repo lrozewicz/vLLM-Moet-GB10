@@ -5,6 +5,7 @@
 # merge it into the branch first; do not ship the regeneration.
 csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 tests/model_executor/layers/test_moe_w2_persistence.py
+tests/reasoning/test_think_block_router.py
 tests/v1/spec_decode/test_dspark_scheduler.py
 tools/nvfp4_flashinfer_sm120/README.md
 tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh

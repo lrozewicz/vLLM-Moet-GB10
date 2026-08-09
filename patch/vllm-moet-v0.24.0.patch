@@ -694,6 +694,95 @@ index 0000000..316674c
 +    replay_b = graph_out.clone()
 +    torch.cuda.synchronize()
 +    assert torch.equal(replay_a, replay_b)
+diff --git a/tests/reasoning/test_think_block_router.py b/tests/reasoning/test_think_block_router.py
+new file mode 100644
+index 0000000..ab2bd28
+--- /dev/null
++++ b/tests/reasoning/test_think_block_router.py
+@@ -0,0 +1,83 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Routing rules of ThinkBlockRouterParser (DS4-Flash-0731).
++
++Text-level tests against `_route_think_blocks`: no tokenizer, no network, so
++they also cover the streaming path, which feeds the same function.
++"""
++
++import pytest
++
++from vllm.reasoning.deepseek_v3_reasoning_parser import _route_think_blocks
++
++TOOL_CALL = (
++    '<｜DSML｜tool_calls><｜DSML｜invoke name="bash">'
++    '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>'
++    "</｜DSML｜invoke></｜DSML｜tool_calls>"
++)
++
++
++def route(text: str, in_think: bool = False, holdback: bool = False):
++    segments, new_in_think, pending = _route_think_blocks(text, in_think, holdback)
++    reasoning = "".join(t for k, t in segments if k == "reasoning")
++    content = "".join(t for k, t in segments if k == "content")
++    return reasoning, content, new_in_think, pending
++
++
++@pytest.mark.parametrize(
++    "output",
++    [
++        "Checking the repo." + TOOL_CALL,
++        "<think>Need to look.</think>" + TOOL_CALL,
++        # The two shapes that used to lose the call: 0731 opens a <think>
++        # span with thinking disabled and calls a tool from inside it,
++        # closing the span afterwards or not at all.
++        "<think>Need to look." + TOOL_CALL + "</think>",
++        "Fine.<think>Now the tool." + TOOL_CALL,
++    ],
++)
++def test_tool_call_always_reaches_content(output):
++    """The tool parser only ever sees `content`, so a call routed to
++    `reasoning` is silently dropped and its raw markup reaches the client."""
++    reasoning, content, _, _ = route(output)
++    assert TOOL_CALL in content
++    assert "DSML" not in reasoning
++
++
++def test_tool_call_ends_the_thinking_span():
++    reasoning, content, in_think, _ = route("<think>Look." + TOOL_CALL + "Done.")
++    assert reasoning == "Look."
++    assert content == TOOL_CALL + "Done."
++    assert in_think is False
++
++
++def test_plain_thinking_still_routes_to_reasoning():
++    reasoning, content, in_think, _ = route("<think>Just thinking.</think>Answer.")
++    assert reasoning == "Just thinking."
++    assert content == "Answer."
++    assert in_think is False
++
++
++def test_streaming_holds_back_a_partial_tool_call_opener():
++    """A delta may cut the opener in half; emitting the prefix as reasoning
++    would make the next delta unrecognizable."""
++    reasoning, content, in_think, pending = route(
++        "<think>Look.<｜DSML｜tool_c", holdback=True
++    )
++    assert reasoning == "Look."
++    assert content == ""
++    assert pending == "<｜DSML｜tool_c"
++    assert in_think is True
++
++
++def test_streaming_recognizes_the_opener_once_completed():
++    """Feed the held-back prefix plus the rest, as the parser does."""
++    reasoning, content, in_think, pending = route(
++        "<｜DSML｜tool_c" + TOOL_CALL[len("<｜DSML｜tool_c") :],
++        in_think=True,
++        holdback=True,
++    )
++    assert TOOL_CALL in content
++    assert reasoning == ""
++    assert in_think is False
++    assert pending == ""
 diff --git a/tests/v1/spec_decode/test_dspark_scheduler.py b/tests/v1/spec_decode/test_dspark_scheduler.py
 new file mode 100644
 index 0000000..34b0d78
@@ -11589,7 +11678,7 @@ index 11fca8e..0c7b3c8 100644
  
      def _flush_engine_parsers(
 diff --git a/vllm/reasoning/deepseek_v3_reasoning_parser.py b/vllm/reasoning/deepseek_v3_reasoning_parser.py
-index dbaf0b1..56b4115 100644
+index dbaf0b1..1cfdb98 100644
 --- a/vllm/reasoning/deepseek_v3_reasoning_parser.py
 +++ b/vllm/reasoning/deepseek_v3_reasoning_parser.py
 @@ -1,11 +1,13 @@
@@ -11606,7 +11695,7 @@ index dbaf0b1..56b4115 100644
  from vllm.reasoning import ReasoningParser
  from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
  
-@@ -13,14 +15,176 @@ from .identity_reasoning_parser import IdentityReasoningParser
+@@ -13,14 +15,189 @@ from .identity_reasoning_parser import IdentityReasoningParser
  
  if TYPE_CHECKING:
      from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -11615,6 +11704,13 @@ index dbaf0b1..56b4115 100644
  
 +_THINK_START = "<think>"
 +_THINK_END = "</think>"
++
++# A tool call is an action, not reasoning. 0731 sometimes opens a <think> span
++# spontaneously (see ThinkBlockRouterParser) and then emits a tool call inside
++# it; routing that to `reasoning` hides it from the tool parser, which only
++# ever sees `content`, so the call is dropped and the raw DSML markup surfaces
++# in the client. Treat an opener as an implicit </think>.
++_TOOL_CALL_STARTS = ("<｜DSML｜tool_calls>", "<｜DSML｜function_calls>")
 +
 +
 +def _route_think_blocks(
@@ -11645,8 +11741,14 @@ index dbaf0b1..56b4115 100644
 +        elif text.startswith(_THINK_START):
 +            in_think = True
 +            text = text[len(_THINK_START) :]
++        elif in_think and any(text.startswith(t) for t in _TOOL_CALL_STARTS):
++            # Implicit </think>: leave the opener in the text so it is emitted
++            # as content and the tool parser can pick the call up.
++            in_think = False
 +        elif holdback and (
-+            _THINK_START.startswith(text) or _THINK_END.startswith(text)
++            _THINK_START.startswith(text)
++            or _THINK_END.startswith(text)
++            or any(t.startswith(text) for t in _TOOL_CALL_STARTS)
 +        ):
 +            # The tail might complete into a tag with the next delta.
 +            pending = text
@@ -11786,7 +11888,7 @@ index dbaf0b1..56b4115 100644
      """
  
      def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
-@@ -31,11 +195,27 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
+@@ -31,11 +208,27 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
          enable_thinking = bool(chat_kwargs.get("enable_thinking", False))
          thinking = thinking or enable_thinking
  

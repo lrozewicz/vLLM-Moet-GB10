@@ -15,6 +15,16 @@ The what-and-why of each change against upstream is in
 
 ### Fixed
 
+- **Tool calls emitted inside a `<think>` span were dropped** ([#1](https://github.com/lrozewicz/vLLM-Moet-GB10/issues/1)).
+  0731 opens a thinking block spontaneously even with `enable_thinking: false`
+  - v0.2.0 stopped the raw `</think>` tags from leaking, but not this: the
+  router sent the whole span to `reasoning`, and the tool parser only ever
+  sees `content`, so the call never executed and its raw DSML markup showed
+  up in the client. Reported with three runs on two large coding projects,
+  onset around 50K tokens of context. A tool-call opener now acts as an
+  implicit `</think>`. Regression test: `tests/reasoning/test_think_block_router.py`
+  (8 text-level cases, no tokenizer or network; 5 fail before the fix).
+
 - **DFlash aux hidden states were a no-op flatten.** The DFlash branch fed
   drafts `hidden_states.flatten(1)`, but between decoder layers
   `hidden_states` is the single-stream `x` returned by

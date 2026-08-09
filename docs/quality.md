@@ -102,6 +102,10 @@ therefore what it costs — is a property of the traffic, not of the setting alo
 | prose (PL), temperature 1.0 | 11.8% of steps | 12.8 tok/s (n=11, 10.7–14.5) | 15.6 (n=8, 13.5–16.4) | −2.8 tok/s (**−18%**) |
 | prose (EN), temperature 1.0 | 13.9% of steps | 12.9 tok/s (n=3, 11.9–13.9) | 17.5 (n=3, 16.7–18.0) | −4.5 tok/s (**−26%**) |
 
+Re-confirmed on image `v032` (the tool-call routing fix) at the shipped 0.60/64:
+code 21.1 tok/s (n=3), gate firing on 3.7% of steps - unchanged. The prose rows
+were not re-run there; the fix touches text routing in the reasoning parser only.
+
 **On the workload this box actually serves — agentic coding — the protective setting costs
 about 4%,** and the two points are barely separable given the run-to-run spread. Greedy
 decoding on code is confident, so the safety net almost never triggers no matter where `tau`

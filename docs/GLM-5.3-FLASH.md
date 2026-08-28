@@ -1,10 +1,37 @@
 # GLM-5.3-Flash on a single GB10 — feasibility, budget, and the port
 
-**Status (2026-08-28): bring-up in progress.** Everything in the *Established*
-sections below is computed from the published checkpoint or verified against
-code in this repo. Nothing here is a measured serving result yet — the
-checkpoint is still downloading. Sections marked **OPEN** are the risks that
-only a real boot can close.
+**Status (2026-08-28): the image builds and the overlay installs; the
+checkpoint is still downloading.** Everything in the *Established* sections is
+computed from the published checkpoint or verified against code. Nothing here
+is a measured serving result. Sections marked **OPEN** are what only a real
+boot can close.
+
+Verified on the GB10 box, not just on paper:
+
+```
+=== arch: aarch64 ===
+torch 2.13.0+cu130 cuda 13.0
+vllm 0.1.dev20051+g487ecf187
+glm5next present: /usr/.../vllm/models/glm5next/__init__.py
+flashinfer 0.6.17
+modules: 9 written, 0 already current
+hooks: fp8.py / envs.py / gpu_model_runner.py patched
+overlay installed
+moe_w2 hook OK | moe_w2 tiers OK | fp8 forward hook OK
+cubins for K=4096/2048 present
+-> vllm-moet-glm53:latest (20.8 GB)
+```
+
+The `fp8 forward hook OK` line matters most: it re-reads
+`Fp8MoEMethod.apply` out of the *installed* module and asserts the W2 branch is
+in it, so the anchors held against the real 0.29-dev file rather than against
+a synthetic stub.
+
+One thing to watch: the vendor image ships **flashinfer 0.6.17**, while the
+recipe's prerequisites say 0.6.17+ but its troubleshooting section says
+"0.6.18 or newer" for sparse-MLA init. The vendor built this image for this
+model, so 0.6.17 is presumably fine - but a sparse-MLA initialization error at
+boot has an obvious first suspect.
 
 ## The short answer
 

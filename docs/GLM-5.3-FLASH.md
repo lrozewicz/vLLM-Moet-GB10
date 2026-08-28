@@ -121,6 +121,16 @@ handle this checkpoint:
   more memory and a quietly mixed-precision stack. The compose file therefore
   pins `VLLM_MOE_W2_NUM_LAYERS=45` rather than trusting the lookup.
 
+### The plane builder needs no changes
+
+`build_layer_planes_fp8` is shape-generic: it reads `E, N13, K13` and
+`_, N2, K2` straight off the staged tensors and calls `_require_kernels(K13,
+K2)`. For this checkpoint that is E=288, N13=4096 (gate|up fused), K13=4096,
+N2=4096, K2=2048 — both K values in the shipped cubin set, and every plane
+size divisible by the 4- and 32-element packing the planes use. The block
+scales are the `(128, 128)` the builder already assumes, and vLLM fuses the
+checkpoint's separate `[16, 32]` gate/up scales into the `[32, 32]` it wants.
+
 ### The monolithic-dispatch trap (found and closed statically)
 
 Skipping `_setup_kernel` leaves `self.moe_kernel` as `None`, and in 0.29-dev
@@ -265,15 +275,15 @@ than adopting the recipe's number.
 
 ## OPEN questions (only a boot can answer)
 
-1. **Does the plane builder accept a `[2048, 4096]` / `[4096, 2048]` expert
-   pair with 128x128 block scales?** Shapes and scale layout match what the
-   FP8 path already handles on DS4; unverified for this exact pair.
-2. **Does the recurrent-state rewind actually hold?** The mechanism is
+1. **Does the recurrent-state rewind actually hold?** The mechanism is
    implemented and described above, but only a long generation on hardware can
    confirm it. The failure signature is specific and worth knowing in advance:
    output that starts coherent and drifts or degenerates as the reply grows,
    appearing only with `VLLM_MOE_W2_GATE=1`.
-3. Prefill throughput, and therefore the usable context window.
+2. Prefill throughput, and therefore the usable context window.
+3. Whether the FP8 backend oracle picks a monolithic class here at all - the
+   override makes it moot, but the log line says which backend was chosen and
+   is worth reading once.
 
 ## Reproducing
 

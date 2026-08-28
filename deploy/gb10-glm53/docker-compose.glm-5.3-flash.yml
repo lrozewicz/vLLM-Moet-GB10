@@ -1,0 +1,184 @@
+# GLM-5.3-Flash (321B MoE / 18B active, multimodal, hybrid KDA + NoPE sparse
+# MLA) on a SINGLE NVIDIA GB10 box (DGX Spark / ASUS Ascent GX10, 121.6 GiB
+# unified memory).
+#
+# STATUS: bring-up configuration. The memory budget, tensor shapes and kernel
+# coverage below are computed from the published checkpoint and verified
+# against this repo's cubin set; end-to-end serving numbers are NOT measured
+# yet and this file carries none. See docs/GLM-5.3-FLASH.md for what is
+# established fact and what is still open.
+#
+# ============================ WHY THIS FITS ==================================
+#
+# The routed experts are 97% of the checkpoint: 43 layers x 288 experts x
+# (gate+up+down) x 2048 x 4096 = 311.6e9 parameters. At the checkpoint's FP8
+# that is ~306 GiB and cannot be loaded at all here. At the 2-bit
+# tensor-symmetric planes it is 1.69 GiB/layer:
+#
+#   routed experts, 42 main-stack layers x 1.69 GiB .............. 70.9 GiB
+#   everything else: FP8 dense MLP + MLA, BF16 KDA (9.4 GB - the
+#   single largest non-expert item), embeddings, vision tower ..... 15.4 GiB
+#   ---------------------------------------------------------------------
+#   weights, no speculation ...................................... 86.3 GiB
+#
+# leaving ~35 GiB for KV, activations and graphs. KV is unusually cheap for a
+# 320B model: only 12 of 45 layers keep a growing cache (kv_lora_rank 512 and
+# NoPE, so 512 elements/token/layer), the other 34 are KDA linear attention
+# with a constant-size recurrent state (~71 MiB/sequence).
+#
+# THE MTP LAYER IS NOT FREE. Layer 45 (the MTP draft head) is a FULL MoE layer
+# with its own 288 experts - 6.75 GiB at FP8. Upstream deliberately leaves the
+# drafter unquantized (its acceptance numbers were measured that way), and
+# `is_w2_layer` honours that by cutting at num_hidden_layers. On this box that
+# choice costs 5 GiB of the remaining headroom, so speculation is staged
+# separately rather than enabled here - see docs/GLM-5.3-FLASH.md#mtp.
+#
+# UNIFIED MEMORY, THE SHORT VERSION (long version in the DS4 compose file):
+#   - host RAM IS VRAM: anything a discrete-GPU design parks in "cheap host
+#     RAM" competes with your weights 1:1. Hence the NVMe store below.
+#   - MemAvailable is not a danger signal; watch /proc/pressure/memory.
+#   - torch.cuda.mem_get_info lies while the loader is reading (page cache
+#     counts as used), which is why the boot guard needs an explicit valve.
+# ============================================================================
+
+services:
+  glm53-moet:
+    image: vllm-moet-glm53:latest
+    container_name: glm53-moet
+    # "no", NOT "unless-stopped": during bring-up an auto-restart loop resets
+    # the tensor counters every cycle and masks the real error message.
+    restart: "no"
+    ipc: host
+    ports:
+      - "8000:8000"
+    volumes:
+      # Stock FP8 checkpoint (~306 GiB). Downloaded separately; the container
+      # starts fully offline (see env below).
+      - /mnt/adata/ai/models/glm-5.3-flash:/model:ro
+      # torch.compile / cudagraph caches - persist across restarts.
+      - /mnt/adata/ai/models/glm-5.3-flash-cache:/root/.cache
+      # Persistent planes cache (quantization results). After the first boot
+      # every later boot LOADER-SKIPs the checkpoint entirely: no staging, no
+      # requant. Sequential I/O - a slower (USB/SATA) disk is fine here.
+      - /mnt/adata/ai/models/glm-5.3-flash-packs:/packs
+      # FP4 delta-tier pack. Random reads at serve time (gate promotions) -
+      # this one belongs on the INTERNAL NVMe.
+      - /var/lib/glm53-packs-nvme:/packs-nvme
+    environment:
+      # --- vLLM-Moet core ---
+      - VLLM_MOE_W2=1                  # 2-bit expert planes. Without it the
+                                       #   306 GiB of experts cannot fit at all.
+      # EXPLICIT pool size, not "auto": auto sizes from mem_get_info after KV
+      # allocation, and on unified memory that number is detached from reality.
+      # Floor for this model: 42 layers x top-8 x 12 MiB slots is the decode
+      # working set; 10 GiB sits comfortably above it -> strict replay, no
+      # degraded mode.
+      - VLLM_MOE_W2_DELTA_GB=10
+      # >>> THE unified-memory fix: FP4 tier host store on NVMe, not pinned RAM.
+      - VLLM_MOE_W2_STORE_DIR=/packs-nvme
+      # Persistent quantization cache -> LOADER-SKIP on every boot after the first.
+      - VLLM_MOE_W2_PLANES_CACHE=/packs/planes-cache
+      # Confidence gate: low-confidence steps are re-decided on FP4-promoted
+      # experts (promote -> re-forward fixed point). This is what recovers
+      # quality over bare 2-bit, which upstream measured to degenerate.
+      #
+      # HYBRID CAVEAT - read before trusting this on GLM-5.3-Flash. The gate
+      # REPLAYS a step's forward. On DS4 that is harmless: every layer is
+      # attention, and re-writing the same KV slots with the same values is
+      # idempotent. Here 34 of 45 layers are KDA linear attention, which READS
+      # its recurrent state and writes the ADVANCED state back in place - a
+      # replay would advance it twice and corrupt the rest of the sequence.
+      # The overlay handles this by snapshotting the recurrent-state tensors
+      # before the first replay and rewinding them before each one (~214 MiB
+      # of copies at max-num-seqs 2, ~0.1% of decode time at the measured DS4
+      # fire rates). That mechanism is NOT yet verified on hardware: bring up
+      # with the gate OFF first, confirm coherent long generations, then turn
+      # it on and check that quality improves rather than degrading over the
+      # length of a reply - drifting or degenerating long outputs would be the
+      # signature of a state-rewind bug.
+      - VLLM_MOE_W2_GATE=1
+      # The resident-fit boot guard reads torch.cuda.mem_get_info, which on
+      # unified memory counts the loader's page cache as "used" and cannot see
+      # that the explicit pool above is already allocated. This is the code's
+      # documented consent valve; a real shortfall still fails as a plain OOM.
+      - VLLM_MOE_W2_FORCE_RESIDENT=1
+      # Gate telemetry: per-fire trace + KPI. Cheap, and the single most
+      # valuable diagnostic during bring-up (on DS4 these lines exposed a
+      # 38%-fire-rate pathology that cost half the decode rate).
+      - VLLM_MOE_W2_GATE_TRACE=1
+      - VLLM_MOE_W2_KPI_EVERY=100
+      # Live-tunable gate knobs (mtime-cached, re-read on change): sweep tau /
+      # promote budget on a warm server, no restarts. Start at the upstream
+      # defaults (0.60 / 64) - they are a deliberate quality-first operating
+      # point, see docs/quality.md#gate-operating-point.
+      - VLLM_MOE_W2_GATE_TAU_FILE=/packs-nvme/knobs/tau.txt
+      - VLLM_MOE_W2_GATE_MAX_PROMOTE_FILE=/packs-nvme/knobs/max_promote.txt
+      # Fused unpermute (Triton): skips the fp32 zero+scatter buffers per layer
+      # per chunk. Worth ~a third of the DS4 prefill win on this box.
+      - VLLM_MOE_W2_FUSED_UNPERMUTE=1
+      # Return allocator segments eagerly - on unified memory every retained
+      # buffer is real silicon.
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # --- startup hygiene: zero network = zero silent hangs ---
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - HF_HUB_DISABLE_XET=1
+      - TOKENIZERS_PARALLELISM=false
+      - VLLM_API_KEY=${VLLM_API_KEY:-change-me}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120m               # the first boot quantizes 311e9 expert
+                                       #   parameters - no watchdog may kill it
+    command:
+      - "--model=/model"
+      - "--served-model-name"
+      - "glm-5.3-flash"
+      # Reasoning and tools per the vendor recipe for this checkpoint. Thinking
+      # is ALWAYS on for GLM-5.3-Flash (the generation prompt opens <think>
+      # unconditionally); depth is chosen per request with reasoning_effort
+      # low|high|max, defaulting to max. For agent use pass "low" or "high"
+      # explicitly, and clear_thinking=true in chat scenarios.
+      - "--reasoning-parser=glm45"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser=glm47"
+      - "--host=0.0.0.0"
+      - "--port=8000"
+      - "--trust-remote-code"
+      # Loader WITHOUT mmap - mandatory on GB10. The default safetensors
+      # loader mmaps every shard and never releases the mappings; a 306 GiB
+      # checkpoint against 121 GiB of memory wedges the box mid-load,
+      # unkillably. The Run:ai streamer reads into its own buffers under a
+      # HARD memory cap. concurrency 2 matches the DS4 setting that survives
+      # here; the cap is per-buffer, not total.
+      - "--load-format=runai_streamer"
+      - "--model-loader-extra-config"
+      - '{"concurrency": 2, "memory_limit": 2147483648}'
+      - "--kv-cache-dtype=fp8"
+      - "--block-size=256"
+      # 128K to start. KV is not the binding constraint on this model (12 MLA
+      # layers at 512 elements/token, 34 KDA layers with constant state), so
+      # the ceiling is prefill time; raise once prefill is measured.
+      - "--max-model-len=131072"
+      - "--gpu-memory-utilization=0.92"
+      - "--max-num-seqs=2"
+      # Prefill on this box is weight-read-bound, so the chunk scales roughly
+      # linearly (measured on DS4: 512 -> ~250 tok/s, 4096 -> 753 tok/s).
+      - "--max-num-batched-tokens=4096"
+      - "--no-scheduler-reserve-full-isl"
+      - "--tensor-parallel-size=1"
+      # NO --speculative-config yet: see the MTP note in the header. MTP is
+      # the largest single decode win available here (~2x on DS4), but its
+      # draft layer is a full 288-expert MoE layer and enabling it is a
+      # memory decision, not a flag flip.
+      - "--compilation-config"
+      - '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'

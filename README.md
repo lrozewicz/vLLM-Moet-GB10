@@ -147,6 +147,31 @@ number understates the checkpoint by ~4x. The moment a 0731-trained DFlash
 speculator exists, this stack should hit ~2x the current decode. If you have
 the training capacity - the runtime is ready and we will gladly test.
 
+## GLM-5.3-Flash (bring-up in progress)
+
+A second model is being brought up on this stack:
+**[zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (321B
+total / 18B active, multimodal, hybrid KDA + NoPE sparse MLA). The computed
+budget is **~86.3 GiB of weights** — more headroom than DS4-0731 has — and it
+needs **no new SASS kernels**: its expert shapes land on the existing K=4096
+and K=2048 cubins.
+
+It cannot use the v0.24.0 patch, because vLLM's `glm5next` implementation ships
+only in the vendor `glm53-flash` images (0.29-dev). So the layering is
+inverted: `tools/apply_w2_overlay.py` installs the 2-bit expert engine
+*extracted from the same patch* onto the vendor image, keeping the patch as the
+single source of truth for W2 code.
+
+One finding is worth flagging beyond this model: **the confidence gate's
+replay is not safe on hybrid models as written.** 34 of GLM-5.3-Flash's 45
+layers are KDA linear attention, which advance their recurrent state in place —
+replaying a step advances it twice and silently corrupts the sequence, where on
+DS4's all-attention stack the same replay is idempotent. The overlay snapshots
+and rewinds that state around a replay.
+
+Status, full budget, and the open questions: [`docs/GLM-5.3-FLASH.md`](docs/GLM-5.3-FLASH.md).
+No serving numbers yet — the checkpoint is still downloading.
+
 ## Roadmap
 
 - More big-MoE models on single-GB10.

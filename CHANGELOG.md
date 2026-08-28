@@ -13,6 +13,34 @@ The what-and-why of each change against upstream is in
 
 ## Unreleased
 
+### Added
+
+- **GLM-5.3-Flash bring-up** (321B / 18B active, multimodal, hybrid KDA +
+  NoPE sparse MLA). Not yet booted - no serving numbers here until it is.
+  - `tools/apply_w2_overlay.py`: installs the 2-bit expert engine onto a vLLM
+    tree that is not v0.24.0, by extracting the `moe_w2_*` modules **from the
+    generated patch** (so the patch stays the single source of truth) and
+    re-applying the hooks by anchor. Needed because vLLM's `glm5next`
+    implementation exists only in the vendor `glm53-flash` images (0.29-dev).
+    Verified: every vLLM symbol the W2 modules import still resolves in
+    0.29-dev, and the four `Fp8MoEMethod` signatures are unchanged.
+  - `deploy/gb10-glm53/`: image, compose and a rate-limited checkpoint
+    downloader.
+  - Two hazards found and closed statically, before any boot:
+    **monolithic dispatch** - skipping `_setup_kernel` leaves `moe_kernel`
+    None, so `is_monolithic` falls through to `experts_cls`, and some FP8
+    backends advertise a monolithic class first; the W2 hook in `apply` would
+    never run. W2 layers now force the modular path, and `apply_monolithic`
+    raises instead of computing on replaced tensors.
+    **Recurrent-state corruption** - the confidence gate replays a step's
+    forward, which is idempotent on DS4's all-attention stack but not here:
+    34 of 45 layers advance a recurrent state in place. The gate now snapshots
+    the Mamba-spec caches and rewinds them before each replay, and refuses to
+    fire if it cannot find them.
+  - Established without hardware: ~86.3 GiB of weights (vs ~91.4 for
+    DS4-0731), and no new SASS kernels - K=4096/2048 are both in the shipped
+    `_a32` set. Details: `docs/GLM-5.3-FLASH.md`.
+
 ### Fixed
 
 - **Tool calls emitted inside a `<think>` span were dropped** ([#1](https://github.com/lrozewicz/vLLM-Moet-GB10/issues/1)).

@@ -74,6 +74,14 @@ services:
       # working set; 10 GiB sits comfortably above it -> strict replay, no
       # degraded mode.
       - VLLM_MOE_W2_DELTA_GB=10
+      # EXPLICIT layer count, for the same reason DELTA_GB is explicit. The
+      # W2 cutoff normally reads num_hidden_layers through get_text_config(),
+      # which handles this composite VLM config correctly - but its failure
+      # mode is a SILENT fallback to 43 (the DS4 layout). On a 45-layer model
+      # that would send layers 43-44 down the stock FP8 path: ~13.5 GiB more
+      # memory and a quietly mixed-precision stack, with only an error line to
+      # notice. Upstream logged this exact class of bug on 78-layer GLM-5.2.
+      - VLLM_MOE_W2_NUM_LAYERS=45
       # >>> THE unified-memory fix: FP4 tier host store on NVMe, not pinned RAM.
       - VLLM_MOE_W2_STORE_DIR=/packs-nvme
       # Persistent quantization cache -> LOADER-SKIP on every boot after the first.

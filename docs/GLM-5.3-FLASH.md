@@ -116,6 +116,10 @@ handle this checkpoint:
 - `_layer_cutoff` reads `num_hidden_layers` through `get_text_config()`, which
   unwraps composite VLM configs — necessary here, since this is a
   `...ForConditionalGeneration` with the language model under `text_config`.
+  Its failure mode is a *silent* fallback to 43 (the DS4 layout), which on a
+  45-layer model would send layers 43-44 down the stock FP8 path: ~13.5 GiB
+  more memory and a quietly mixed-precision stack. The compose file therefore
+  pins `VLLM_MOE_W2_NUM_LAYERS=45` rather than trusting the lookup.
 
 ### The monolithic-dispatch trap (found and closed statically)
 

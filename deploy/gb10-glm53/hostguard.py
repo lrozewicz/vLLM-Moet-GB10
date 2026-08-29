@@ -22,6 +22,11 @@ button.
 
     setsid ./hostguard.py glm53-moet 25 > ~/glm53-run/hostguard.log 2>&1 &
 
+Check whether it is running with a pattern that cannot match your own shell
+command - `pgrep -f hostguard` matches the ssh command line that contains the
+word, reports success, and you end up running unguarded. Use `pgrep -f
+"[h]ostguard.py"`.
+
 Args: <container> [min_available_gib] [poll_seconds]
 """
 
@@ -84,7 +89,12 @@ def main() -> int:
                 status = kill_container(CONTAINER)
                 print(f"{time.strftime('%H:%M:%S')} KILLED {CONTAINER}: "
                       f"{status}", flush=True)
-                return 0
+                # KEEP RUNNING. Exiting here was a real bug: the next boot
+                # attempt then had no guard at all, and the box wedged again.
+                # A bring-up loop restarts the container many times; the guard
+                # must outlive every one of them.
+                low_streak = 0
+                time.sleep(15)  # let the kill settle before watching again
         else:
             low_streak = 0
         time.sleep(POLL_S)

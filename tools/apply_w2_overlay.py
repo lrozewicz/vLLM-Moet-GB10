@@ -671,6 +671,36 @@ CUBIT_BIG_NEW = '''    # {mark}: derive the big params from `expected` instead o
 '''
 
 
+CUBIT_EMPTYCACHE_OLD = '''    # fp8 experts are 4x the bytes of the mxfp4 path and the requant makes f32
+    # temporaries -> smaller H2D chunks, per-expert quantize.
+    chunk = 8
+    for e0 in range(0, E, chunk):
+'''
+
+CUBIT_EMPTYCACHE_NEW = '''    # fp8 experts are 4x the bytes of the mxfp4 path and the requant makes f32
+    # temporaries -> smaller H2D chunks, per-expert quantize.
+    chunk = 8
+    for e0 in range(0, E, chunk):
+        # {mark}: return the allocator's cached blocks each chunk.
+        #
+        # MEASURED on GB10, and it is the difference between booting and not:
+        # without this the requant loop consumed ~1.33 GiB per expert that
+        # never came back - 85 GiB gone in 64 experts, with the box wedging
+        # before a single layer finished. It is not a leak. The FP8 dequant
+        # path is f64-heavy (w.double(), the block scales repeat_interleave'd
+        # to a full [N, K] f64, then w * s, then u and u.abs() inside
+        # _f64_to_codes_scales), so each expert churns several ~134 MiB f64
+        # temporaries; the caching allocator kept growing instead of reusing
+        # them, and on unified memory those bytes are the machine's only RAM.
+        # With this call: allocated tracks the planes alone (+~1.8 GiB per
+        # layer, which is what they weigh), free memory stays flat at ~75-85
+        # GiB, and layers complete in ~14 s each.
+        #
+        # The other quantization paths never hit this because their dequant
+        # is a lookup, not f64 arithmetic over the whole expert.
+        torch.cuda.empty_cache()
+'''
+
 def patch_moe_w2_cubit(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
     if MARK in text:
@@ -679,6 +709,8 @@ def patch_moe_w2_cubit(path: Path) -> bool:
         (CUBIT_SKIP_OLD, CUBIT_SKIP_NEW, "moe_w2_cubit.plan_pack_skip"),
         (CUBIT_ARM_OLD, CUBIT_ARM_NEW, "moe_w2_cubit.arm_stream_build format branch"),
         (CUBIT_BIG_OLD, CUBIT_BIG_NEW, "moe_w2_cubit.arm_stream_build big tuple"),
+        (CUBIT_EMPTYCACHE_OLD, CUBIT_EMPTYCACHE_NEW,
+         "moe_w2_cubit.build_layer_planes_fp8 requant loop"),
     ):
         if text.count(old) != 1:
             raise ApplyError(

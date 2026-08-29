@@ -701,6 +701,47 @@ CUBIT_EMPTYCACHE_NEW = '''    # fp8 experts are 4x the bytes of the mxfp4 path a
         torch.cuda.empty_cache()
 '''
 
+CUBIT_CACHESTORE_OLD = '''    if tier is not None:
+        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
+        del fp13, fp2
+
+    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
+                  N13, K13, N2, K2, E,
+                  ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
+                   f"w2_{scale_suffix}"))
+'''
+
+CUBIT_CACHESTORE_NEW = '''    # {mark}: persist this layer's planes, exactly as the mxfp4 builder does.
+    # Upstream's FP8 builder simply never did - the same gap as its missing
+    # STREAM-BUILD, and from the same cause: on a discrete GPU a re-quant per
+    # boot is a nuisance, not a blocker.
+    #
+    # Here it IS a blocker. MEASURED on GB10: a full first boot peaks at
+    # ~96 GiB of planes plus ~10 GiB of allocator reserve plus the staging of
+    # the layers still in flight, and runs out at layer ~40 of 43. Serving
+    # the planes from this cache removes the requant, its f64 temporaries and
+    # the staging from the boot entirely, so the peak becomes the planes
+    # themselves - which do fit.
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as planes_cache)
+
+    lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
+    if planes_cache.enabled() and lidx is not None:
+        planes_cache.store(
+            lidx,
+            dict(planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
+                 fp13=fp13, fp2=fp2))
+
+    if tier is not None:
+        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
+        del fp13, fp2
+
+    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
+                  N13, K13, N2, K2, E,
+                  ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
+                   f"w2_{scale_suffix}"))
+'''
+
 def patch_moe_w2_cubit(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
     if MARK in text:
@@ -711,6 +752,8 @@ def patch_moe_w2_cubit(path: Path) -> bool:
         (CUBIT_BIG_OLD, CUBIT_BIG_NEW, "moe_w2_cubit.arm_stream_build big tuple"),
         (CUBIT_EMPTYCACHE_OLD, CUBIT_EMPTYCACHE_NEW,
          "moe_w2_cubit.build_layer_planes_fp8 requant loop"),
+        (CUBIT_CACHESTORE_OLD, CUBIT_CACHESTORE_NEW,
+         "moe_w2_cubit.build_layer_planes_fp8 cache store"),
     ):
         if text.count(old) != 1:
             raise ApplyError(

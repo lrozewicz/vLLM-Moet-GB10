@@ -215,7 +215,21 @@ services:
       # _canonicalize_sparse_mla_kv_cache_dtype), and 0.6.18 is the release
       # that handles a NoPE model there. bfloat16 is NOT a fallback - it
       # leaves no valid backend at all for head_size=512.
-      - "--kv-cache-dtype=fp8"
+      # TRITON_MLA, forced. The auto-selected FLASHINFER_MLA_SPARSE_SM120
+      # cannot serve this model at all: it *requires* the packed fp8_ds_mla
+      # layout ("NotImplementedError: ... requires the packed fp8_ds_mla KV
+      # cache layout"), and that layout's writer asserts a 64-wide rope half
+      # this NoPE model does not have ("pe_dim must be 64 for fp8_ds_mla").
+      # Both directions are closed, so the backend itself has to change.
+      #
+      # TRITON_MLA is the other candidate vLLM lists for capability 12
+      # (platforms/cuda.py), and it carries no packed-layout requirement.
+      # Note vLLM's own comment one branch below, describing exactly this
+      # model - "NoPE sparse MLA (GLM-5-Next shape: qk_rope_head_dim=0 with
+      # an indexer)" - as handled on the SM90 path; consumer Blackwell simply
+      # is not wired for it yet.
+      - "--attention-backend=TRITON_MLA"
+      - "--kv-cache-dtype=bfloat16"
       - "--block-size=256"
       # 128K to start. KV is not the binding constraint on this model (12 MLA
       # layers at 512 elements/token, 34 KDA layers with constant state), so

@@ -364,6 +364,49 @@ reachable. It bounds host-side allocations (the ones that actually run away);
 `cudaMalloc` is shmem-backed and not fully accounted, so it is a blast shield,
 not a budget.
 
+## Where it stands: the model loads, vLLM cannot attend to it on sm_121
+
+**The W2 port works.** With the four FP8-path fixes and the planes cache, a
+boot now loads all 43 layers, serves 39+ of them from cache, allocates KV and
+reaches CUDA-graph capture. Peak memory behaves as computed (~96 GiB of
+planes, ~10 GiB of allocator reserve, freed per layer).
+
+**What blocks serving is upstream, not this fork.** GLM-5.3-Flash is NoPE
+sparse MLA (`qk_rope_head_dim: 0` with an indexer), and on consumer Blackwell
+vLLM 0.29-dev has no attention backend that can serve that shape. All three
+candidates were tried on hardware:
+
+| backend | result |
+|---|---|
+| `FLASHINFER_MLA_SPARSE_SM120` (auto-selected) | *requires* the packed `fp8_ds_mla` layout, whose writer asserts `pe_dim == 64` — this model has 0 |
+| `TRITON_MLA` (the other candidate for capability 12) | `Reason: ['sparse not supported']` |
+| `FLASHINFER_MLA_SPARSE` | `Reason: ['compute capability not supported']` |
+
+The KV dtype cannot route around it either: `auto` and `fp8` are both
+rewritten to `fp8_ds_mla` for that backend, and `bfloat16` leaves no valid
+backend at all for `head_size=512`. FlashInfer 0.6.18 — the vendor recipe's
+advice for sparse-MLA init trouble — changes nothing, because the assert
+lives in vLLM's own `cache_kernels.cu`, not in FlashInfer.
+
+vLLM's own source says as much. `platforms/cuda.py` returns
+`[TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120]` for capability 12, while the
+branch immediately below it describes **exactly this model** — "NoPE sparse
+MLA (GLM-5-Next shape: qk_rope_head_dim=0 with an indexer)" — and routes it to
+FlashInfer's SM90 FA3 path. Consumer Blackwell is simply not wired for it yet.
+
+### What would unblock it
+
+1. **Upstream support** — the cheapest path by far: a NoPE-capable sparse-MLA
+   backend for capability 12, or letting the SM120 backend drive a
+   non-`fp8_ds_mla` layout. Worth filing against vLLM with the three errors
+   above; the fix is theirs, and the recipe already claims Blackwell support.
+2. **Teach `fp8_ds_mla` a zero-width rope half** — patch
+   `concat_and_cache_mla` and the matching read path. Real CUDA work, and it
+   would have to be redone against every vLLM bump.
+3. **SGLang** — the model card lists it first, and this box already runs
+   SGLang nightlies for Qwen3.8. Whether its sparse-MLA path is NoPE-capable
+   on sm_121 is unknown and worth one experiment before writing CUDA.
+
 ## OPEN questions (only a boot can answer)
 
 1. **Load order**: does a shard-ordered loader keep the in-flight set at the

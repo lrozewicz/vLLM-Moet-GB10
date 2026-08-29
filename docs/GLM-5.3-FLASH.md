@@ -1,37 +1,35 @@
 # GLM-5.3-Flash on a single GB10 — feasibility, budget, and the port
 
-**Status (2026-08-28): the image builds and the overlay installs; the
-checkpoint is still downloading.** Everything in the *Established* sections is
-computed from the published checkpoint or verified against code. Nothing here
-is a measured serving result. Sections marked **OPEN** are what only a real
-boot can close.
-
-Verified on the GB10 box, not just on paper:
+**Status (2026-08-29): SERVING.** GLM-5.3-Flash answers on a single GX10.
 
 ```
-=== arch: aarch64 ===
-torch 2.13.0+cu130 cuda 13.0
-vllm 0.1.dev20051+g487ecf187
-glm5next present: /usr/.../vllm/models/glm5next/__init__.py
-flashinfer 0.6.17
-modules: 9 written, 0 already current
-hooks: fp8.py / envs.py / gpu_model_runner.py patched
-overlay installed
-moe_w2 hook OK | moe_w2 tiers OK | fp8 forward hook OK
-cubins for K=4096/2048 present
--> vllm-moet-glm53:latest (20.8 GB)
+INFO: Application startup complete.
 ```
 
-The `fp8 forward hook OK` line matters most: it re-reads
-`Fp8MoEMethod.apply` out of the *installed* module and asserts the W2 branch is
-in it, so the anchors held against the real 0.29-dev file rather than against
-a synthetic stub.
+First measured decode: **11.4 tok/s** on code (123 tokens, n=3, zero spread),
+**without speculation** — MTP is not enabled yet. ~7 GiB free at serve.
 
-One thing to watch: the vendor image ships **flashinfer 0.6.17**, while the
-recipe's prerequisites say 0.6.17+ but its troubleshooting section says
-"0.6.18 or newer" for sparse-MLA init. The vendor built this image for this
-model, so 0.6.17 is presumably fine - but a sparse-MLA initialization error at
-boot has an obvious first suspect.
+It took two independent fixes, and only one of them is ours:
+
+| blocker | fix | whose |
+|---|---|---|
+| 306 GiB will not fit in 121.6 GiB | 2-bit planes -> ~96 GiB | this fork (four FP8-path gaps) |
+| no attention backend for NoPE on sm_12x | zero-pad the latent 512 -> 576 | [chriswritescode-dev/glm-5.3-flash-sm120](https://github.com/chriswritescode-dev/glm-5.3-flash-sm120), out of [vllm#53963](https://github.com/vllm-project/vllm/issues/53963) |
+
+The second one deserves the credit for unblocking this. Rather than write a
+kernel for `d=512`, it reuses the existing `d=576` GLM_NSA one and zero-pads:
+a zero RoPE block contributes nothing to the QK dot, softmax is unchanged, and
+the value comes from the 512-wide NoPE region — exact, and not one line of
+CUDA. It costs 656 B/token instead of ~528 (~24% more DSA KV over 11 layers).
+
+Their overlay was verified on 4x RTX PRO 6000 (384 GB) against the 306 GiB FP8
+checkpoint. What this fork adds is the half that makes it fit on **one** box.
+Build both with `deploy/gb10-glm53/build_combined.sh`, which fetches their
+Dockerfile at build time — their repo carries no LICENSE, so we must not
+redistribute it.
+
+The sections below were written during bring-up and are kept because the
+negative results still cost ~10 minutes of loading each to reproduce.
 
 ## The short answer
 

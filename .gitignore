@@ -17,3 +17,4 @@ patch/*.whl
 
 # bench: smoke-test results are transient (real releases are committed)
 bench/results/smoke/
+.build-combined/

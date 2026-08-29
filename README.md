@@ -147,30 +147,42 @@ number understates the checkpoint by ~4x. The moment a 0731-trained DFlash
 speculator exists, this stack should hit ~2x the current decode. If you have
 the training capacity - the runtime is ready and we will gladly test.
 
-## GLM-5.3-Flash (bring-up in progress)
+## GLM-5.3-Flash — serving on one GB10
 
-A second model is being brought up on this stack:
 **[zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (321B
-total / 18B active, multimodal, hybrid KDA + NoPE sparse MLA). The computed
-budget is **~86.3 GiB of weights** — more headroom than DS4-0731 has — and it
-needs **no new SASS kernels**: its expert shapes land on the existing K=4096
-and K=2048 cubins.
+total / 18B active, multimodal, hybrid KDA + NoPE sparse MLA) now answers on a
+single GX10. First measured decode: **11.4 tok/s** on code, no speculation yet.
 
-It cannot use the v0.24.0 patch, because vLLM's `glm5next` implementation ships
-only in the vendor `glm53-flash` images (0.29-dev). So the layering is
-inverted: `tools/apply_w2_overlay.py` installs the 2-bit expert engine
-*extracted from the same patch* onto the vendor image, keeping the patch as the
-single source of truth for W2 code.
+Two independent blockers had to fall, and only one was ours:
 
-One finding is worth flagging beyond this model: **the confidence gate's
-replay is not safe on hybrid models as written.** 34 of GLM-5.3-Flash's 45
-layers are KDA linear attention, which advance their recurrent state in place —
-replaying a step advances it twice and silently corrupts the sequence, where on
-DS4's all-attention stack the same replay is idempotent. The overlay snapshots
-and rewinds that state around a replay.
+- **Size** — 306 GiB of FP8 experts cannot fit in 121.6 GiB. The W2 engine
+  brings them to ~96 GiB of 2-bit planes. Getting the FP8 path there exposed
+  four gaps that only matter on unified memory (streaming build, allocator
+  release, and both halves of the planes cache); details in
+  [`docs/GLM-5.3-FLASH.md`](docs/GLM-5.3-FLASH.md).
+- **Attention** — this checkpoint is NoPE (`qk_rope_head_dim: 0`) and consumer
+  Blackwell has no sparse-MLA backend for that shape. Solved by
+  **[chriswritescode-dev/glm-5.3-flash-sm120](https://github.com/chriswritescode-dev/glm-5.3-flash-sm120)**
+  (from [vllm#53963](https://github.com/vllm-project/vllm/issues/53963)): zero-pad
+  the 512-wide latent into the existing 576-wide GLM_NSA geometry. Exact, and
+  no CUDA. That work is theirs and it is what unblocked this.
 
-Status, full budget, and the open questions: [`docs/GLM-5.3-FLASH.md`](docs/GLM-5.3-FLASH.md).
-No serving numbers yet — the checkpoint is still downloading.
+Their overlay is verified on 4x RTX PRO 6000; this fork contributes the half
+that makes the model fit on **one** box. Build both:
+
+```bash
+./deploy/gb10-glm53/build_combined.sh
+```
+
+It fetches their Dockerfile at build time rather than vendoring it — their repo
+carries no LICENSE, so redistribution is not ours to do.
+
+One finding worth flagging beyond this model: **the confidence gate's replay is
+not safe on hybrid models as written.** 34 of this model's 45 layers are KDA
+linear attention, which advance a recurrent state in place — replaying a step
+advances it twice and silently corrupts the sequence, where on DS4's
+all-attention stack the same replay is idempotent. The overlay snapshots and
+rewinds that state around a replay.
 
 ## Roadmap
 

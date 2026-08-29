@@ -43,7 +43,7 @@
 
 services:
   glm53-moet:
-    image: vllm-moet-glm53:latest
+    image: vllm-moet-glm53:combined
     container_name: glm53-moet
     # "no", NOT "unless-stopped": during bring-up an auto-restart loop resets
     # the tensor counters every cycle and masks the real error message.
@@ -215,21 +215,12 @@ services:
       # _canonicalize_sparse_mla_kv_cache_dtype), and 0.6.18 is the release
       # that handles a NoPE model there. bfloat16 is NOT a fallback - it
       # leaves no valid backend at all for head_size=512.
-      # TRITON_MLA, forced. The auto-selected FLASHINFER_MLA_SPARSE_SM120
-      # cannot serve this model at all: it *requires* the packed fp8_ds_mla
-      # layout ("NotImplementedError: ... requires the packed fp8_ds_mla KV
-      # cache layout"), and that layout's writer asserts a 64-wide rope half
-      # this NoPE model does not have ("pe_dim must be 64 for fp8_ds_mla").
-      # Both directions are closed, so the backend itself has to change.
-      #
-      # TRITON_MLA is the other candidate vLLM lists for capability 12
-      # (platforms/cuda.py), and it carries no packed-layout requirement.
-      # Note vLLM's own comment one branch below, describing exactly this
-      # model - "NoPE sparse MLA (GLM-5-Next shape: qk_rope_head_dim=0 with
-      # an indexer)" - as handled on the SM90 path; consumer Blackwell simply
-      # is not wired for it yet.
-      - "--attention-backend=TRITON_MLA"
-      - "--kv-cache-dtype=bfloat16"
+      # fp8 i backend AUTO - overlay NoPE (patche sm120 z issue #53963) sprawia,
+      # ze FLASHINFER_MLA_SPARSE_SM120 obsluguje ten model: dopycha 512-wymiarowy
+      # latent zerami do geometrii 576 GLM_NSA. `--kv-cache-dtype fp8` jest
+      # WYMAGANE - ta sciezka przyjmuje wylacznie spakowany uklad fp8_ds_mla,
+      # a bf16 KV nie ma na tej architekturze kernela w ogole.
+      - "--kv-cache-dtype=fp8"
       - "--block-size=256"
       # 128K to start. KV is not the binding constraint on this model (12 MLA
       # layers at 512 elements/token, 34 KDA layers with constant state), so

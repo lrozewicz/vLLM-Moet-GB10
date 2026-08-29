@@ -113,43 +113,58 @@ def _splice(text: str, anchor: str, insert: str, *, where: str, after: bool = Tr
 
 
 FP8_STAGE_HOOK = '''
-        # {mark}: the raw fp8 checkpoint experts of ALL layers do not fit the
-        # GPU during load (GLM-5.3-Flash: 43 x 288 x 3 x 2048 x 4096 fp8 =
-        # ~306 GiB), so stage them in host memory until the 2-bit planes are
-        # built in process_weights_after_loading. Block-quant checkpoints only.
+        # {mark}: the raw fp8 experts of ALL layers cannot be staged in
+        # memory here (GLM-5.3-Flash: ~306 GiB against 121.6 GiB of unified
+        # memory), so take the same three-step path the mxfp4/NVFP4 methods
+        # take, in order of preference:
+        #   1. LOADER-SKIP - a pack/planes cache already holds this layer,
+        #      so the checkpoint tensors are never read at all;
+        #   2. STREAM-BUILD - requantize each layer the moment its last
+        #      expert tensor lands, so peak staging is one layer (~6 GiB),
+        #      not the checkpoint;
+        #   3. classic host staging - the upstream FP8 behaviour, correct
+        #      only where host RAM is a separate, larger pool.
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 
         if self.block_quant and moe_w2_cubit.is_w2_layer(
             getattr(layer, "layer_name", "")
         ):
+            # Remembered for `is_monolithic` below: quant methods are
+            # per-layer, and this is the earliest point where the layer name
+            # is known.
+            self._moe_w2_force_modular = True
+            if moe_w2_cubit.plan_pack_skip(layer):
+                return
+            if moe_w2_cubit.arm_stream_build(layer):
+                return
             for pname in (
                 "w13_weight",
-                f"w13_{{self.weight_scale_name}}",
+                f"w13_{self.weight_scale_name}",
                 "w2_weight",
-                f"w2_{{self.weight_scale_name}}",
+                f"w2_{self.weight_scale_name}",
             ):
                 p_ = getattr(layer, pname)
                 attrs = dict(p_.__dict__)  # weight_loader, quant_method, ...
                 newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
                 layer.register_parameter(pname, newp)
                 set_weight_attrs(newp, attrs)
-            # Remembered for `is_monolithic` below: quant methods are
-            # per-layer, and this is the earliest point where the layer name
-            # is known.
-            self._moe_w2_force_modular = True
 '''
 
-FP8_BUILD_HOOK = '''        # {mark}: re-quantize the host-staged fp8 experts into 2-bit
-        # tensor-symmetric planes and skip the stock kernel setup entirely.
+FP8_BUILD_HOOK = '''        # {mark}: adopt the 2-bit planes and skip the stock kernel setup.
+        # The layer may already be built - LOADER-SKIP served it from a pack,
+        # or STREAM-BUILD requantized it during load - so only build here
+        # when neither happened. The key comes from create_weights, which is
+        # what the stream builder used.
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 
         if self.block_quant and moe_w2_cubit.is_w2_layer(
             getattr(layer, "layer_name", "")
         ):
-            key = len(moe_w2_cubit._LAYERS)
-            moe_w2_cubit.build_layer_planes_fp8(
-                layer, key, scale_suffix=self.weight_scale_name
-            )
+            key = getattr(layer, "_moe_w2_create_key", len(moe_w2_cubit._LAYERS))
+            if not getattr(layer, "_moe_w2_stream_built", False):
+                moe_w2_cubit.build_layer_planes_fp8(
+                    layer, key, scale_suffix=self.weight_scale_name
+                )
             layer._moe_w2_key = key
             return
 
@@ -224,7 +239,7 @@ def patch_fp8(path: Path) -> bool:
     text = _splice(
         text,
         "            layer.w13_input_scale = None\n            layer.w2_input_scale = None\n",
-        FP8_STAGE_HOOK.format(mark=MARK),
+        FP8_STAGE_HOOK.replace("{mark}", MARK),
         where="fp8.Fp8MoEMethod.create_weights",
     )
 
@@ -232,7 +247,7 @@ def patch_fp8(path: Path) -> bool:
     text = _splice(
         text,
         "    def process_weights_after_loading(self, layer: RoutedExperts) -> None:\n",
-        FP8_BUILD_HOOK.format(mark=MARK),
+        FP8_BUILD_HOOK.replace("{mark}", MARK),
         where="fp8.Fp8MoEMethod.process_weights_after_loading",
     )
 
@@ -245,7 +260,7 @@ def patch_fp8(path: Path) -> bool:
         "        assert not self.is_monolithic\n"
         "        assert self.moe_kernel is not None\n"
         "        return self.moe_kernel.apply(\n",
-        FP8_APPLY_HOOK.format(mark=MARK),
+        FP8_APPLY_HOOK.replace("{mark}", MARK),
         where="fp8.Fp8MoEMethod.apply",
         after=False,
     )
@@ -256,7 +271,7 @@ def patch_fp8(path: Path) -> bool:
     text = _splice(
         text,
         "        assert self.is_monolithic\n        assert self.moe_kernel is not None\n",
-        FP8_MONOLITHIC_GUARD.format(mark=MARK),
+        FP8_MONOLITHIC_GUARD.replace("{mark}", MARK),
         where="fp8.Fp8MoEMethod.apply_monolithic",
         after=False,
     )
@@ -264,7 +279,7 @@ def patch_fp8(path: Path) -> bool:
     # 4. EPLB is incompatible with the plane layout
     if FP8_EPLB_OLD not in text:
         raise ApplyError("fp8.Fp8MoEMethod.supports_eplb: anchor not found")
-    text = text.replace(FP8_EPLB_OLD, FP8_EPLB_NEW.format(mark=MARK), 1)
+    text = text.replace(FP8_EPLB_OLD, FP8_EPLB_NEW.replace("{mark}", MARK), 1)
 
     path.write_text(text, encoding="utf-8")
     return True
@@ -298,7 +313,7 @@ def patch_envs(path: Path) -> bool:
     )
     text = text.replace(
         "def validate_environ(hard_fail: bool) -> None:\n",
-        ENVS_HELPERS.format(mark=MARK).lstrip("\n")
+        ENVS_HELPERS.replace("{mark}", MARK).lstrip("\n")
         + "\ndef validate_environ(hard_fail: bool) -> None:\n",
         1,
     )
@@ -553,7 +568,7 @@ def patch_runner(path: Path) -> bool:
     text = _splice(
         text,
         "import vllm.envs as envs\n",
-        RUNNER_IMPORT_HOOK.format(mark=MARK),
+        RUNNER_IMPORT_HOOK.replace("{mark}", MARK),
         where="gpu_model_runner imports",
     )
     text = _splice(
@@ -564,21 +579,21 @@ def patch_runner(path: Path) -> bool:
     )
     text = text.replace(
         "        # Run the model.\n        # Use persistent buffers for CUDA graphs.\n",
-        RUNNER_DRAIN_HOOK.format(mark=MARK)
+        RUNNER_DRAIN_HOOK.replace("{mark}", MARK)
         + "        # Run the model.\n        # Use persistent buffers for CUDA graphs.\n",
         1,
     )
     text = _splice(
         text,
         "        self.execute_model_state = ExecuteModelState(\n",
-        RUNNER_GATE_HOOK.format(mark=MARK),
+        RUNNER_GATE_HOOK.replace("{mark}", MARK),
         where="gpu_model_runner gate site",
         after=False,
     )
     text = _splice(
         text,
         "        bind_kv_cache(\n",
-        RUNNER_RECURRENT_HOOK.format(mark=MARK),
+        RUNNER_RECURRENT_HOOK.replace("{mark}", MARK),
         where="gpu_model_runner kv-cache init",
         after=False,
     )
@@ -586,9 +601,90 @@ def patch_runner(path: Path) -> bool:
         text,
         "            format_gib(self.model_memory_usage),\n"
         "            time_after_load - time_before_load,\n        )\n",
-        RUNNER_FLOOR_HOOK.format(mark=MARK),
+        RUNNER_FLOOR_HOOK.replace("{mark}", MARK),
         where="gpu_model_runner pool-floor site",
     )
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+
+# --------------------------------------------------- moe_w2_cubit extensions
+# The one place this tool edits a W2 module rather than copying it verbatim.
+#
+# Upstream's streaming first-boot exists for the modelopt-NVFP4 and mxfp4
+# checkpoint paths, but NOT for FP8 block-quant: Fp8MoEMethod stages the whole
+# expert checkpoint in host RAM and requantizes afterwards. On a discrete GPU
+# that is merely wasteful (host RAM is a separate pool); on GB10, where host
+# RAM IS VRAM, it is fatal - GLM-5.3-Flash's experts are ~306 GiB against
+# 121.6 GiB of memory. Measured on the first boot attempt: memory climbed
+# ~12 GiB/min through 86 GiB with no plane ever built, and the run had to be
+# stopped before the box wedged.
+#
+# DS4-Flash never exposed this: its checkpoint is FP4 and takes the mxfp4
+# path, which IS armed. So the two functions that dispatch on checkpoint
+# format learn the FP8 variant here.
+
+CUBIT_FILE = "vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py"
+
+CUBIT_SKIP_OLD = '''    for pname in ("w13_weight", "w13_weight_scale",
+                  "w2_weight", "w2_weight_scale"):
+'''
+
+CUBIT_SKIP_NEW = '''    # {mark}: FP8 block-quant names its scales *_weight_scale_inv, so the
+    # fixed tuple below raised AttributeError on that path instead of
+    # skipping the layer.
+    _sfx = (
+        "weight_scale_inv"
+        if getattr(layer, "w13_weight_scale_inv", None) is not None
+        else "weight_scale"
+    )
+    for pname in ("w13_weight", f"w13_{_sfx}",
+                  "w2_weight", f"w2_{_sfx}"):
+'''
+
+CUBIT_ARM_OLD = '''    if all(getattr(layer, _n, None) is not None
+           for _n in ("w13_weight_scale_2", "w2_weight_scale_2")):
+'''
+
+CUBIT_ARM_NEW = '''    # {mark}: FP8 block-quant variant. Its scales are *_weight_scale_inv and
+    # its builder takes the suffix, so neither existing branch fits; without
+    # this the FP8 path falls back to staging the whole checkpoint, which
+    # cannot fit in unified memory.
+    if getattr(layer, "w13_weight_scale_inv", None) is not None:
+        import functools as _ft
+
+        expected = {"w13_weight": 2 * E, "w13_weight_scale_inv": 2 * E,
+                    "w2_weight": E, "w2_weight_scale_inv": E}
+        layer._moe_w2_stream_builder = _ft.partial(
+            build_layer_planes_fp8, scale_suffix="weight_scale_inv")
+    elif all(getattr(layer, _n, None) is not None
+             for _n in ("w13_weight_scale_2", "w2_weight_scale_2")):
+'''
+
+CUBIT_BIG_OLD = '''    big = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+'''
+
+CUBIT_BIG_NEW = '''    # {mark}: derive the big params from `expected` instead of naming them,
+    # so the FP8 (*_scale_inv) branch above stubs the right four.
+    big = tuple(n for n in expected if not n.endswith("_scale_2"))
+'''
+
+
+def patch_moe_w2_cubit(path: Path) -> bool:
+    text = path.read_text(encoding="utf-8")
+    if MARK in text:
+        return False
+    for old, new, where in (
+        (CUBIT_SKIP_OLD, CUBIT_SKIP_NEW, "moe_w2_cubit.plan_pack_skip"),
+        (CUBIT_ARM_OLD, CUBIT_ARM_NEW, "moe_w2_cubit.arm_stream_build format branch"),
+        (CUBIT_BIG_OLD, CUBIT_BIG_NEW, "moe_w2_cubit.arm_stream_build big tuple"),
+    ):
+        if text.count(old) != 1:
+            raise ApplyError(
+                f"{where}: anchor found {text.count(old)} times, expected 1"
+            )
+        text = text.replace(old, new.replace("{mark}", MARK), 1)
     path.write_text(text, encoding="utf-8")
     return True
 
@@ -605,7 +701,11 @@ def verify(root: Path, with_runner: bool = True) -> list[str]:
     for rel in W2_MODULES:
         if not (root / rel).exists():
             problems.append(f"missing module: {rel}")
-    checked = ["vllm/model_executor/layers/quantization/fp8.py", "vllm/envs.py"]
+    checked = [
+        CUBIT_FILE,
+        "vllm/model_executor/layers/quantization/fp8.py",
+        "vllm/envs.py",
+    ]
     if with_runner:
         checked.append(RUNNER_FILE)
     for rel in checked:
@@ -658,6 +758,7 @@ def main() -> int:
     print(f"modules: {copied} written, {len(W2_MODULES) - copied} already current")
 
     edits = [
+        (CUBIT_FILE, patch_moe_w2_cubit),
         ("vllm/model_executor/layers/quantization/fp8.py", patch_fp8),
         ("vllm/envs.py", patch_envs),
     ]

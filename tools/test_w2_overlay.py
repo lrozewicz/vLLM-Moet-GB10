@@ -259,5 +259,54 @@ class TestHooks(unittest.TestCase):
             ov.patch_envs(f)
 
 
+class TestCubitFp8StreamBuild(unittest.TestCase):
+    """The FP8 path must reach STREAM-BUILD, not full-checkpoint staging.
+
+    This is the bug that stopped the first boot: upstream arms streaming for
+    the NVFP4 and mxfp4 formats only, so FP8 block-quant staged the whole
+    306 GiB of experts in host memory - fatal where host RAM is VRAM.
+    """
+
+    def setUp(self):
+        if not PATCH.exists():
+            self.skipTest("patch not present")
+        self.dir = Path(tempfile.mkdtemp())
+        mod = ov.extract_new_files(PATCH)[ov.CUBIT_FILE]
+        dst = self.dir / ov.CUBIT_FILE
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(mod)
+        self.f = dst
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_patch_applies_and_parses(self):
+        self.assertTrue(ov.patch_moe_w2_cubit(self.f))
+        text = self.f.read_text()
+        ast.parse(text)
+        self.assertIn("weight_scale_inv", text)
+        self.assertIn("build_layer_planes_fp8", text)
+
+    def test_idempotent(self):
+        ov.patch_moe_w2_cubit(self.f)
+        before = self.f.read_text()
+        ov.patch_moe_w2_cubit(self.f)
+        self.assertEqual(before, self.f.read_text())
+
+    def test_fp8_branch_precedes_nvfp4(self):
+        """scale_inv must be checked first: an FP8 layer has no scale_2, so
+        the old code fell through to the mxfp4 branch and the WRONG builder."""
+        ov.patch_moe_w2_cubit(self.f)
+        text = self.f.read_text()
+        fp8 = text.index('w13_weight_scale_inv", None) is not None')
+        nvfp4 = text.index('"w13_weight_scale_2", "w2_weight_scale_2"')
+        self.assertLess(fp8, nvfp4)
+
+    def test_big_params_derived_from_expected(self):
+        ov.patch_moe_w2_cubit(self.f)
+        text = self.f.read_text()
+        self.assertIn('big = tuple(n for n in expected', text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

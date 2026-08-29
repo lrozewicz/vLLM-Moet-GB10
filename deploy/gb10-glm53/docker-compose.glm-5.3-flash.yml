@@ -68,12 +68,15 @@ services:
       # --- vLLM-Moet core ---
       - VLLM_MOE_W2=1                  # 2-bit expert planes. Without it the
                                        #   306 GiB of experts cannot fit at all.
-      # EXPLICIT pool size, not "auto": auto sizes from mem_get_info after KV
-      # allocation, and on unified memory that number is detached from reality.
-      # Floor for this model: 42 layers x top-8 x 12 MiB slots is the decode
-      # working set; 10 GiB sits comfortably above it -> strict replay, no
-      # degraded mode.
-      - VLLM_MOE_W2_DELTA_GB=10
+      # STAGE 1: FP4 delta tier OFF. Its per-step lifecycle
+      # (wait_manager_idle / step_end) is driven from the runner, and this
+      # build carries those hooks in the V1 runner only - vLLM 0.29 selects
+      # the V2 runner for this model ("Using V2 Model Runner" in the log).
+      # Running the tier with nobody calling step_end accumulates pins until
+      # it silently stops promoting, and nobody calling wait_manager_idle
+      # lets background residency commits overlap graph readers. Bare 2-bit
+      # is the honest configuration until the hooks are ported to V2.
+      - VLLM_MOE_W2_DELTA_GB=0
       # EXPLICIT layer count, for the same reason DELTA_GB is explicit. The
       # W2 cutoff normally reads num_hidden_layers through get_text_config(),
       # which handles this composite VLM config correctly - but its failure
@@ -86,25 +89,13 @@ services:
       - VLLM_MOE_W2_STORE_DIR=/packs-nvme
       # Persistent quantization cache -> LOADER-SKIP on every boot after the first.
       - VLLM_MOE_W2_PLANES_CACHE=/packs/planes-cache
-      # Confidence gate: low-confidence steps are re-decided on FP4-promoted
-      # experts (promote -> re-forward fixed point). This is what recovers
-      # quality over bare 2-bit, which upstream measured to degenerate.
-      #
-      # HYBRID CAVEAT - read before trusting this on GLM-5.3-Flash. The gate
-      # REPLAYS a step's forward. On DS4 that is harmless: every layer is
-      # attention, and re-writing the same KV slots with the same values is
-      # idempotent. Here 34 of 45 layers are KDA linear attention, which READS
-      # its recurrent state and writes the ADVANCED state back in place - a
-      # replay would advance it twice and corrupt the rest of the sequence.
-      # The overlay handles this by snapshotting the recurrent-state tensors
-      # before the first replay and rewinding them before each one (~214 MiB
-      # of copies at max-num-seqs 2, ~0.1% of decode time at the measured DS4
-      # fire rates). That mechanism is NOT yet verified on hardware: bring up
-      # with the gate OFF first, confirm coherent long generations, then turn
-      # it on and check that quality improves rather than degrading over the
-      # length of a reply - drifting or degenerating long outputs would be the
-      # signature of a state-rewind bug.
-      - VLLM_MOE_W2_GATE=1
+      # STAGE 1: confidence gate OFF, same reason as the delta tier above -
+      # its promote -> re-forward loop lives in the runner hooks, which this
+      # build installs in V1 while the engine runs V2. It also has nothing to
+      # promote with the delta tier off. Quality on bare 2-bit is expected to
+      # be the weak point (upstream measured bare 2-bit degenerating), so
+      # this stage answers "does it load and generate", not "is it good".
+      - VLLM_MOE_W2_GATE=0
       # The resident-fit boot guard reads torch.cuda.mem_get_info, which on
       # unified memory counts the loader's page cache as "used" and cannot see
       # that the explicit pool above is already allocated. This is the code's

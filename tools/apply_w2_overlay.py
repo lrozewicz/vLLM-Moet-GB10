@@ -792,6 +792,79 @@ CUBIT_FP8_CONSUME_NEW = '''    if _try_skip_requant(layer, layer_key, E, N13, K1
         return
 '''
 
+CUBIT_FINISH_EMPTY_OLD = '''    logger.info("moe_w2: layer %d planes built (%.2f GiB)", layer_key,
+                (planes13.nbytes + sc13.nbytes + planes2.nbytes + sc2.nbytes)
+                / 2**30)
+'''
+
+CUBIT_FINISH_EMPTY_NEW = '''    logger.info("moe_w2: layer %d planes built (%.2f GiB)", layer_key,
+                (planes13.nbytes + sc13.nbytes + planes2.nbytes + sc2.nbytes)
+                / 2**30)
+    # {mark}: hand the allocator's reserve back after every layer, not just
+    # inside the requant loop. MEASURED on GB10 near the end of a boot:
+    # allocated 96.1 GiB but reserved 106.1 GiB - ten gigabytes of cached
+    # blocks that the checkpoint staging of the remaining layers then could
+    # not use. On a discrete GPU that reserve sits in VRAM and nobody
+    # notices; here it is the same memory the loader needs, and the boot dies
+    # ~3 layers short with it held.
+    #
+    # This runs on the cached path too (planes read back from disk), where
+    # there is no requant loop to do it.
+    torch.cuda.empty_cache()
+'''
+
+MLA_FILE = "vllm/model_executor/layers/attention/mla_attention.py"
+
+MLA_NOPE_OLD = '''        normalized_kv_cache_dtype = _canonicalize_sparse_mla_kv_cache_dtype(
+            self.attn_backend, kv_cache_dtype
+        )
+'''
+
+MLA_NOPE_NEW = '''        # {mark}: do not normalize a NoPE model onto `fp8_ds_mla`.
+        #
+        # _canonicalize_sparse_mla_kv_cache_dtype rewrites auto|fp8|fp8_e4m3
+        # to fp8_ds_mla for the FLASHINFER_MLA_SPARSE_SM120 backend, but that
+        # format's writer asserts a 64-wide rope half:
+        #
+        #   RuntimeError: concat_and_cache_mla ...
+        #   pe_dim must be 64 for fp8_ds_mla        (cache_kernels.cu:866)
+        #
+        # GLM-5.3-Flash sets qk_rope_head_dim: 0 (mla_use_nope), so the
+        # rewrite hands the model a cache format that cannot represent it and
+        # the engine dies on the first KV write - after a ~10 minute load.
+        # Neither `auto` nor `fp8` avoids it (both are rewritten), and asking
+        # for bfloat16 instead leaves "No valid attention backend found" for
+        # head_size=512. Upgrading FlashInfer to 0.6.18, which the vendor
+        # recipe suggests for sparse-MLA init trouble, does not help either:
+        # the assert is in vLLM's own kernel, not in FlashInfer.
+        #
+        # So gate the rewrite on the model actually having a rope half. A
+        # NoPE model keeps the dtype it was given and takes the backend's
+        # standard fp8 path.
+        if self.qk_rope_head_dim == 0:
+            normalized_kv_cache_dtype = kv_cache_dtype
+        else:
+            normalized_kv_cache_dtype = _canonicalize_sparse_mla_kv_cache_dtype(
+                self.attn_backend, kv_cache_dtype
+            )
+'''
+
+
+def patch_mla_attention(path: Path) -> bool:
+    """Keep a NoPE model off the fp8_ds_mla cache format."""
+    text = path.read_text(encoding="utf-8")
+    if MARK in text:
+        return False
+    if text.count(MLA_NOPE_OLD) != 1:
+        raise ApplyError(
+            f"mla_attention KV-format selection: anchor found "
+            f"{text.count(MLA_NOPE_OLD)} times, expected 1"
+        )
+    text = text.replace(MLA_NOPE_OLD, MLA_NOPE_NEW.replace("{mark}", MARK), 1)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
 def patch_moe_w2_cubit(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
     if MARK in text:
@@ -810,6 +883,8 @@ def patch_moe_w2_cubit(path: Path) -> bool:
          "moe_w2_cubit._consume_planes_cache finish names"),
         (CUBIT_FP8_CONSUME_OLD, CUBIT_FP8_CONSUME_NEW,
          "moe_w2_cubit.build_layer_planes_fp8 cache read"),
+        (CUBIT_FINISH_EMPTY_OLD, CUBIT_FINISH_EMPTY_NEW,
+         "moe_w2_cubit._finish_layer allocator release"),
     ):
         if text.count(old) != 1:
             raise ApplyError(
@@ -834,6 +909,7 @@ def verify(root: Path, with_runner: bool = True) -> list[str]:
             problems.append(f"missing module: {rel}")
     checked = [
         CUBIT_FILE,
+        MLA_FILE,
         "vllm/model_executor/layers/quantization/fp8.py",
         "vllm/envs.py",
     ]
@@ -890,6 +966,7 @@ def main() -> int:
 
     edits = [
         (CUBIT_FILE, patch_moe_w2_cubit),
+        (MLA_FILE, patch_mla_attention),
         ("vllm/model_executor/layers/quantization/fp8.py", patch_fp8),
         ("vllm/envs.py", patch_envs),
     ]

@@ -48,6 +48,47 @@ RUN echo "=== arch: $(uname -m) ===" \
     && python3 -c "import vllm.models.glm5next as m; print('glm5next present:', m.__file__)" \
     && python3 -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
 
+# --- 0b. FlashInfer 0.6.18. The vendor image ships 0.6.17, and its own
+#         recipe's troubleshooting section says sparse-MLA init needs
+#         "0.6.18 or newer" - which is exactly what we hit:
+#
+#           RuntimeError: concat_and_cache_mla ... pe_dim must be 64 for
+#           fp8_ds_mla
+#
+#         GLM-5.3-Flash is NoPE (qk_rope_head_dim: 0), and on sm_121 the only
+#         backend offered is FLASHINFER_MLA_SPARSE_SM120, which 0.6.17 can
+#         only drive through the `fp8_ds_mla` cache format - a format whose
+#         kernel asserts a 64-wide rope half this model does not have.
+#         Working around it from the vLLM side is a dead end: asking for
+#         bfloat16 KV instead leaves "No valid attention backend found"
+#         (head_size=512, dtype=bfloat16), because that backend has no
+#         non-fp8_ds_mla path in this build.
+#
+#         Upgrading is not a one-liner: flashinfer refuses to import when
+#         `flashinfer-cubin` does not match `flashinfer-python`, and no cubin
+#         wheel exists for 0.6.18 (pypi stops at 0.6.13; the cu130 index only
+#         publishes jit-cache). So drop the cubin package and let jit-cache
+#         supply the kernels - the same shape as deploy/gb10/Dockerfile.
+#
+#         PITFALL carried over from that file: `pip uninstall flashinfer-cubin`
+#         leaves the flashinfer_cubin/ DIRECTORY behind (cubins downloaded
+#         after install are outside the RECORD). Python then treats it as an
+#         implicit namespace package, the import succeeds with no __version__,
+#         and flashinfer's env.py raises - hours later, at model start.
+#         Remove the directory explicitly. The same applies to
+#         flashinfer-jit-cache, which is version-checked just as strictly
+#         (its 0.6.17+cu130 build refuses to sit under a 0.6.18 flashinfer).
+RUN pip uninstall -y --break-system-packages flashinfer-cubin flashinfer-jit-cache || true \
+    && SP="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+    && rm -rf "$SP/flashinfer_cubin" "$SP/flashinfer_jit_cache" \
+    && pip install --no-cache-dir --break-system-packages flashinfer-python==0.6.18 \
+    && python3 -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
+#         No jit-cache wheel either: the cu130 index lists 0.6.18rc10 but the
+#         GitHub release behind it 404s, and there is no stable 0.6.18 build.
+#         So flashinfer JITs its kernels on first use instead. That costs
+#         minutes on the first boot only - /root/.cache is a volume in the
+#         compose file, so the compiled kernels persist across restarts.
+
 # --- 1. the moe_w2 engine, extracted from the generated patch and hooked into
 #        this tree by anchor.  The tool is idempotent and fails loudly if an
 #        upstream call site moved, rather than guessing.

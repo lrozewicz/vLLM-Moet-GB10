@@ -186,6 +186,35 @@ services:
       # remaining tensors, and memory hits 121 GiB with a single layer built.
       # Reading shard-by-shard keeps the in-flight set at the two layers the
       # file layout actually implies.
+      # NOT fp8: on this model that selects the `fp8_ds_mla` cache format,
+      # whose kernel asserts `pe_dim == 64`. GLM-5.3-Flash is NoPE
+      # (qk_rope_head_dim: 0), so it dies at the first KV write:
+      #   RuntimeError: concat_and_cache_mla ... pe_dim must be 64 for
+      #   fp8_ds_mla
+      # The cost of BF16 KV here is trivial and worth stating, because on
+      # DS4 it would not be: only 12 of 45 layers keep a growing cache, at
+      # kv_lora_rank 512 and no rope half, so ~12 KB/token - about 1.6 GiB
+      # for the full 128K window. The other 33 layers are KDA, whose
+      # recurrent state does not grow with context at all.
+      # MUST be bfloat16 spelled out - "auto" is NOT neutral here.
+      # _canonicalize_sparse_mla_kv_cache_dtype rewrites auto|fp8|fp8_e4m3 to
+      # `fp8_ds_mla` whenever the backend is FLASHINFER_MLA_SPARSE_SM120, and
+      # that format's kernel asserts pe_dim == 64. GLM-5.3-Flash is NoPE
+      # (qk_rope_head_dim: 0), so it dies at the first KV write:
+      #   RuntimeError: concat_and_cache_mla ... pe_dim must be 64 for
+      #   fp8_ds_mla
+      # Naming bfloat16 explicitly is the only way past the rewrite. (Same
+      # shape of trap as the Qwen3.8 checkpoint that self-selects fp8 KV.)
+      #
+      # The cost is small on this model and would not be on DS4: only 12 of
+      # 45 layers keep a growing cache (kv_lora_rank 512, no rope half), so
+      # ~12 KB/token - roughly 1.6 GiB for a full 128K window. The other 33
+      # layers are KDA, whose recurrent state does not grow with context.
+      # Back to fp8 once FlashInfer 0.6.18 is in the image: the backend
+      # normalizes this to `fp8_ds_mla` regardless (see
+      # _canonicalize_sparse_mla_kv_cache_dtype), and 0.6.18 is the release
+      # that handles a NoPE model there. bfloat16 is NOT a fallback - it
+      # leaves no valid backend at all for head_size=512.
       - "--kv-cache-dtype=fp8"
       - "--block-size=256"
       # 128K to start. KV is not the binding constraint on this model (12 MLA

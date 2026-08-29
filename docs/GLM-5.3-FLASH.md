@@ -300,15 +300,81 @@ DS4 was **k=2** — deeper drafts accepted ~0% at the tail while costing a full
 drafter pass each, against 273 GB/s of memory bandwidth. Sweep k here rather
 than adopting the recipe's number.
 
+## What the first boot actually taught us (2026-08-29)
+
+The checkpoint finished downloading (306 GiB, 62/62 shards sha256-verified)
+and the boot ran automatically. It did not serve. Two findings, in order of
+how much they cost:
+
+### 1. The FP8 path had no streaming build (fixed)
+
+Upstream arms the streaming per-layer build for **modelopt-NVFP4** and
+**mxfp4** checkpoints. `Fp8MoEMethod` has no such arming: it stages the entire
+expert checkpoint in host RAM and requantizes afterwards. On a discrete GPU
+that is wasteful; here it is impossible - ~306 GiB against 121.6 GiB.
+
+DS4-Flash never exposed this: its checkpoint is FP4 and takes the mxfp4 path,
+which IS armed. **The FP8 path had simply never run on a unified-memory box.**
+
+Fixed in `tools/apply_w2_overlay.py`: `arm_stream_build` learns the FP8
+variant (checked *before* the NVFP4 one - an FP8 layer has no `scale_2` and
+would otherwise fall through to the wrong builder), and `plan_pack_skip` stops
+assuming the `*_weight_scale` suffix. Confirmed on hardware: `STREAM-BUILD
+armed`, **42 of 42 layers armed, none skipped**.
+
+### 2. The loader does not walk the shards in order (open)
+
+With streaming armed, memory still reached 121 GiB with **one** layer built.
+Instrumenting the loader showed why:
+
+```
+DBG armed: 42    NOT armed: 0
+DBG BUILD start key=29 layer=...layers.32...      <- no matching "BUILD done"
+DBG pend layers.32 {w13_weight: 86, w13_weight_scale_inv: 0, ...}
+```
+
+Layer **32** completed while the progress counter read **14%**. That is the
+whole problem: this checkpoint is layer-major, and the index proves it - at
+most **two** layers span any shard boundary, so peak staging should be about
+**14 GiB**:
+
+```
+maximum layers with an open shard range: 2 (at shard 4): [10, 11]
+```
+
+The Run:ai streamer reads them in some other order, so every layer it touches
+early materializes a ~7.2 GiB staging buffer and then waits for the rest of
+its tensors. Forty-two of those do not fit anywhere.
+
+Next step is the plain safetensors loader: the usual argument against it (mmap
+never releases its mappings) does not survive the streaming build, because
+each layer's staging is freed the moment it is requantized, and what mmap
+leaves behind is *page cache* - reclaimable - rather than anonymous
+allocations, which are not. If shard-ordered reading is not enough, the
+fallback is to back the staging buffers with a file on NVMe
+(`torch.from_file`), which makes the peak independent of load order entirely.
+
+### The operational lesson: cap the container
+
+Two runaway loads wedged the whole box - the host ran out of memory, `sshd`
+could no longer fork, and a power cycle was the only way back. `memguard`
+cannot save this: it does not get scheduled either. The compose file now sets
+`mem_limit: 100g`, so the kernel kills the container and the machine stays
+reachable. It bounds host-side allocations (the ones that actually run away);
+`cudaMalloc` is shmem-backed and not fully accounted, so it is a blast shield,
+not a budget.
+
 ## OPEN questions (only a boot can answer)
 
-1. **Does the recurrent-state rewind actually hold?** The mechanism is
+1. **Load order**: does a shard-ordered loader keep the in-flight set at the
+   two layers the file layout implies? See above.
+2. **Does the recurrent-state rewind actually hold?** The mechanism is
    implemented and described above, but only a long generation on hardware can
    confirm it. The failure signature is specific and worth knowing in advance:
    output that starts coherent and drifts or degenerates as the reply grows,
    appearing only with `VLLM_MOE_W2_GATE=1`.
-2. Prefill throughput, and therefore the usable context window.
-3. Whether the FP8 backend oracle picks a monolithic class here at all - the
+3. Prefill throughput, and therefore the usable context window.
+4. Whether the FP8 backend oracle picks a monolithic class here at all - the
    override makes it moot, but the log line says which backend was chosen and
    is worth reading once.
 

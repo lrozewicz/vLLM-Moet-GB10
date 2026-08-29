@@ -49,6 +49,19 @@ services:
     # the tensor counters every cycle and masks the real error message.
     restart: "no"
     ipc: host
+    # mem_limit is kept, but do NOT rely on it here - MEASURED 2026-08-29:
+    # during a GLM-5.3-Flash load `docker stats` reported 9.57 GiB / 100 GiB
+    # for this container while the HOST was at 118 GB used and Shmem was
+    # 51 MB. The allocations that run away go through the NVIDIA driver on
+    # unified memory and are not charged to the container's cgroup, so no
+    # limit value protects the box. Raising it to 110/115g changes nothing.
+    #
+    # What does protect the box is deploy/gb10-glm53/hostguard.py, armed
+    # BEFORE this container: a resident process that reads /proc/meminfo and
+    # kills through the docker socket without forking. memguard.sh cannot do
+    # this job either - it shells out per check, and once the box thrashes it
+    # is not scheduled (it slept through two wedges today).
+    mem_limit: 100g
     ports:
       - "8000:8000"
     volumes:
@@ -153,15 +166,26 @@ services:
       - "--host=0.0.0.0"
       - "--port=8000"
       - "--trust-remote-code"
-      # Loader WITHOUT mmap - mandatory on GB10. The default safetensors
-      # loader mmaps every shard and never releases the mappings; a 306 GiB
-      # checkpoint against 121 GiB of memory wedges the box mid-load,
-      # unkillably. The Run:ai streamer reads into its own buffers under a
-      # HARD memory cap. concurrency 2 matches the DS4 setting that survives
-      # here; the cap is per-buffer, not total.
-      - "--load-format=runai_streamer"
-      - "--model-loader-extra-config"
-      - '{"concurrency": 2, "memory_limit": 2147483648}'
+      - "--load-format=safetensors"
+      # LOADER: plain safetensors, NOT the Run:ai streamer.
+      #
+      # Upstream uses the streamer on GB10 because the default loader mmaps
+      # every shard and never releases the mappings - fatal when the staged
+      # checkpoint is bigger than memory. That reasoning does not survive the
+      # streaming plane build: with STREAM-BUILD each layer is requantized as
+      # its last tensor lands and its staging is freed immediately, so what
+      # mmap leaves behind is page cache, which the kernel can reclaim - not
+      # anonymous allocations, which it cannot.
+      #
+      # And the streamer actively breaks the streaming build here. This
+      # checkpoint is layer-major (measured from the index: at most TWO
+      # layers span any shard boundary, so peak staging should be ~14 GiB),
+      # yet the streamer completed layer 32 while the progress counter read
+      # 14% - it does not walk the shards in order. Every layer it touches
+      # early materializes a ~7.2 GiB staging buffer that then waits for its
+      # remaining tensors, and memory hits 121 GiB with a single layer built.
+      # Reading shard-by-shard keeps the in-flight set at the two layers the
+      # file layout actually implies.
       - "--kv-cache-dtype=fp8"
       - "--block-size=256"
       # 128K to start. KV is not the binding constraint on this model (12 MLA

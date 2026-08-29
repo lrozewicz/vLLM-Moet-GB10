@@ -742,6 +742,56 @@ CUBIT_CACHESTORE_NEW = '''    # {mark}: persist this layer's planes, exactly as 
                    f"w2_{scale_suffix}"))
 '''
 
+CUBIT_CONSUME_SIG_OLD = '''def _consume_planes_cache(layer, layer_key: int, dev,
+                          E: int, N13: int, K13: int, N2: int,
+                          K2: int) -> bool:
+'''
+
+CUBIT_CONSUME_SIG_NEW = '''def _consume_planes_cache(layer, layer_key: int, dev,
+                          E: int, N13: int, K13: int, N2: int,
+                          K2: int, scale_suffix: str = "weight_scale") -> bool:
+'''
+
+CUBIT_CONSUME_FINISH_OLD = '''    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
+                  sc2, N13, K13, N2, K2, E,
+                  ("w13_weight", "w13_weight_scale", "w2_weight",
+                   "w2_weight_scale"))
+'''
+
+CUBIT_CONSUME_FINISH_NEW = '''    # {mark}: the param names are format-dependent (FP8 block-quant uses
+    # *_weight_scale_inv), and _finish_layer stubs exactly these - naming the
+    # wrong ones raises instead of serving the cached layer.
+    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
+                  sc2, N13, K13, N2, K2, E,
+                  ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
+                   f"w2_{scale_suffix}"))
+'''
+
+CUBIT_FP8_CONSUME_OLD = '''    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
+                         ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
+                          f"w2_{scale_suffix}")):
+        return
+'''
+
+CUBIT_FP8_CONSUME_NEW = '''    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
+                         ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
+                          f"w2_{scale_suffix}")):
+        return
+
+    # {mark}: serve this layer from the planes cache when it is there. The
+    # mxfp4 and NVFP4 builders both do this; the FP8 one did not, so a cache
+    # it had just written was never read back and every boot re-quantized
+    # from scratch.
+    #
+    # This is what makes a first boot recoverable. MEASURED: a cold boot gets
+    # ~39 of 43 layers before memory runs out, and those 39 are on disk -
+    # reading them back costs no requant, no f64 temporaries and no
+    # checkpoint staging, which is exactly the headroom the last layers need.
+    if _consume_planes_cache(layer, layer_key, dev, E, N13, K13, N2, K2,
+                             scale_suffix=scale_suffix):
+        return
+'''
+
 def patch_moe_w2_cubit(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
     if MARK in text:
@@ -754,6 +804,12 @@ def patch_moe_w2_cubit(path: Path) -> bool:
          "moe_w2_cubit.build_layer_planes_fp8 requant loop"),
         (CUBIT_CACHESTORE_OLD, CUBIT_CACHESTORE_NEW,
          "moe_w2_cubit.build_layer_planes_fp8 cache store"),
+        (CUBIT_CONSUME_SIG_OLD, CUBIT_CONSUME_SIG_NEW,
+         "moe_w2_cubit._consume_planes_cache signature"),
+        (CUBIT_CONSUME_FINISH_OLD, CUBIT_CONSUME_FINISH_NEW,
+         "moe_w2_cubit._consume_planes_cache finish names"),
+        (CUBIT_FP8_CONSUME_OLD, CUBIT_FP8_CONSUME_NEW,
+         "moe_w2_cubit.build_layer_planes_fp8 cache read"),
     ):
         if text.count(old) != 1:
             raise ApplyError(

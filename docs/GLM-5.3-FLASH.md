@@ -6,8 +6,30 @@
 INFO: Application startup complete.
 ```
 
-First measured decode: **11.4 tok/s** on code (123 tokens, n=3, zero spread),
-**without speculation** — MTP is not enabled yet. ~7 GiB free at serve.
+Measured decode on code (temperature 0, n=3):
+
+| | no MTP | **MTP k=2** |
+|---|---:|---:|
+| decode | 11.4 tok/s | **22.4 tok/s** (21.8 / 22.8 / 22.7) |
+| mean acceptance length | — | **2.81-2.95** |
+| context served | 128K | 64K |
+| free memory at serve | ~7 GiB | ~3 GiB |
+
+Acceptance of 2.9 against a theoretical ceiling of 3.0 (two drafts plus the
+base token) means the drafter is right nearly every step. That answers the
+open question from bring-up: **a 2-bit drafter does not cost acceptance here.**
+Putting layer 45 under W2 (`VLLM_MOE_W2_NUM_LAYERS=46`) was necessary rather
+than merely tidy - that layer is a full 288-expert MoE layer, 6.75 GiB at FP8,
+against ~7 GiB of headroom.
+
+Context drops to 64K with MTP on: the drafter takes the slack, and 128K then
+wants 1.7 GiB of KV against 1.18 GiB available. KV is cheap on this model (12
+of 45 layers keep a growing cache), so this is a straight trade against the
+drafter, not a wall.
+
+For scale, the same box serves DeepSeek-V4-Flash-0731 at ~21 tok/s on code.
+GLM-5.3-Flash is newer and larger (321B vs 304B) and matches it - before the
+FP4 tier and confidence gate, which are still off here.
 
 It took two independent fixes, and only one of them is ours:
 

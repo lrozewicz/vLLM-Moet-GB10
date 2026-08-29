@@ -97,7 +97,14 @@ services:
       # that would send layers 43-44 down the stock FP8 path: ~13.5 GiB more
       # memory and a quietly mixed-precision stack, with only an error line to
       # notice. Upstream logged this exact class of bug on 78-layer GLM-5.2.
-      - VLLM_MOE_W2_NUM_LAYERS=45
+      # 46, NIE 45: obejmuje takze warstwe 45, czyli glowice MTP. Upstream
+      # celowo zostawia drafter nieskwantyzowany (jego liczby akceptacji byly
+      # mierzone tak wlasnie), ale w GLM-5.3-Flash ta glowica to PELNA warstwa
+      # MoE z wlasnymi 288 ekspertami - 6.75 GiB w FP8, a przy serwowaniu
+      # zostaje ~7 GiB. W 2-bit to 1.9 GiB i miesci sie z zapasem.
+      # Do zweryfikowania: czy 2-bitowy drafter psuje akceptacje. Jesli tak,
+      # alternatywa jest oddac mu FP8 kosztem KV (mniejszy max-model-len).
+      - VLLM_MOE_W2_NUM_LAYERS=46
       # >>> THE unified-memory fix: FP4 tier host store on NVMe, not pinned RAM.
       - VLLM_MOE_W2_STORE_DIR=/packs-nvme
       # Persistent quantization cache -> LOADER-SKIP on every boot after the first.
@@ -225,17 +232,27 @@ services:
       # 128K to start. KV is not the binding constraint on this model (12 MLA
       # layers at 512 elements/token, 34 KDA layers with constant state), so
       # the ceiling is prefill time; raise once prefill is measured.
-      - "--max-model-len=131072"
-      - "--gpu-memory-utilization=0.92"
+      # 64K, nie 128K: z wlaczonym MTP drafter zjada zapas i na KV zostaje
+      # 1.18 GiB, a 128K wymaga 1.7 GiB ("To serve at least one request with
+      # the model's max seq len..."). KV jest tu tanie (12 z 45 warstw ma
+      # rosnacy cache), wiec 64K miesci sie z zapasem. Bez MTP mozna wrocic
+      # do 128K - patrz wariant bez --speculative-config.
+      - "--max-model-len=65536"
+      - "--gpu-memory-utilization=0.95"
       - "--max-num-seqs=2"
       # Prefill on this box is weight-read-bound, so the chunk scales roughly
       # linearly (measured on DS4: 512 -> ~250 tok/s, 4096 -> 753 tok/s).
       - "--max-num-batched-tokens=4096"
       - "--no-scheduler-reserve-full-isl"
       - "--tensor-parallel-size=1"
-      # NO --speculative-config yet: see the MTP note in the header. MTP is
-      # the largest single decode win available here (~2x on DS4), but its
-      # draft layer is a full 288-expert MoE layer and enabling it is a
-      # memory decision, not a flag flip.
+      # MTP k=2. Karta modelu i recipe vLLM sugeruja 5; zaczynamy od 2, bo na
+      # GB10 glebsze drafty przegraly na DS4 - pozycje 4-7 akceptowaly ~0%, a
+      # kazdy przebieg draftera zjada pasmo (273 GB/s). Overlay sm120 raportuje
+      # akceptacje 2.5-5.1 na 4x RTX PRO 6000, wiec jest co podnosic - ale
+      # najpierw zmierzmy k=2 tutaj.
+      # max-num-seqs 2 x (k+1) = 6, grubo ponizej progu 64, za ktorym decode
+      # spada ze specjalizowanego kernela FlashInfera.
+      - "--speculative-config"
+      - '{"method":"mtp","num_speculative_tokens":2}'
       - "--compilation-config"
       - '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'

@@ -87,6 +87,8 @@ services:
       - ${V2RUNNER_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
       # LATKA 6: przelacznik VLLM_DISABLE_PDL (patrz patches/patch_pdl_off.py)
       - ${CUDAPLAT_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/platforms/cuda.py:ro
+      # LATKA 7: dtype stanu rekurencyjnego KDA (patches/patch_kda_ssm_dtype.py)
+      - ${MAMBAUTILS_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/mamba_utils.py:ro
     environment:
       # >>> EKSPERYMENT ODZYSKIWANIA JAKOSCI (2026-08-30) <<<
       # Hooki delta tier i bramki pewnosci sa zainstalowane w runnerze V1
@@ -185,6 +187,10 @@ services:
       # czyli takze na sm_121, gdzie nikt go nie walidowal. Dotyka
       # FusedRMSNormGated w 34 warstwach KDA. 1 = zgas (wymaga LATKI 6).
       - VLLM_DISABLE_PDL=${DISABLE_PDL:-0}
+      # Stan rekurencyjny KDA w bf16 zamiast f32 (wymaga LATKI 7). Dyktuje
+      # rozmiar strony mamby, a przez nia strone attention (dzis 6912 tok.),
+      # czyli staly podatek prefix-cache na ture agenta.
+      - VLLM_KDA_SSM_DTYPE=${KDA_SSM:-}
       # Budzet promocji puli FP4 na tik (_PROMOTE_PER_TICK, domyslnie 8).
       # ZMIERZONE 2026-08-31: przy 8 pula wymienia sie w CALOSCI co 32 tiki
       # i czyta 41.7 GiB z pakietu w 2 minuty dekodowania. 0 = zamrozenie

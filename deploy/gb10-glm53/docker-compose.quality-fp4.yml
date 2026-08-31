@@ -1,0 +1,357 @@
+# GLM-5.3-Flash (321B MoE / 18B active, multimodal, hybrid KDA + NoPE sparse
+# MLA) on a SINGLE NVIDIA GB10 box (DGX Spark / ASUS Ascent GX10, 121.6 GiB
+# unified memory).
+#
+# STATUS: bring-up configuration. The memory budget, tensor shapes and kernel
+# coverage below are computed from the published checkpoint and verified
+# against this repo's cubin set; end-to-end serving numbers are NOT measured
+# yet and this file carries none. See docs/GLM-5.3-FLASH.md for what is
+# established fact and what is still open.
+#
+# ============================ WHY THIS FITS ==================================
+#
+# The routed experts are 97% of the checkpoint: 43 layers x 288 experts x
+# (gate+up+down) x 2048 x 4096 = 311.6e9 parameters. At the checkpoint's FP8
+# that is ~306 GiB and cannot be loaded at all here. At the 2-bit
+# tensor-symmetric planes it is 1.69 GiB/layer:
+#
+#   routed experts, 42 main-stack layers x 1.69 GiB .............. 70.9 GiB
+#   everything else: FP8 dense MLP + MLA, BF16 KDA (9.4 GB - the
+#   single largest non-expert item), embeddings, vision tower ..... 15.4 GiB
+#   ---------------------------------------------------------------------
+#   weights, no speculation ...................................... 86.3 GiB
+#
+# leaving ~35 GiB for KV, activations and graphs. KV is unusually cheap for a
+# 320B model: only 12 of 45 layers keep a growing cache (kv_lora_rank 512 and
+# NoPE, so 512 elements/token/layer), the other 34 are KDA linear attention
+# with a constant-size recurrent state (~71 MiB/sequence).
+#
+# THE MTP LAYER IS NOT FREE. Layer 45 (the MTP draft head) is a FULL MoE layer
+# with its own 288 experts - 6.75 GiB at FP8. Upstream deliberately leaves the
+# drafter unquantized (its acceptance numbers were measured that way), and
+# `is_w2_layer` honours that by cutting at num_hidden_layers. On this box that
+# choice costs 5 GiB of the remaining headroom, so speculation is staged
+# separately rather than enabled here - see docs/GLM-5.3-FLASH.md#mtp.
+#
+# UNIFIED MEMORY, THE SHORT VERSION (long version in the DS4 compose file):
+#   - host RAM IS VRAM: anything a discrete-GPU design parks in "cheap host
+#     RAM" competes with your weights 1:1. Hence the NVMe store below.
+#   - MemAvailable is not a danger signal; watch /proc/pressure/memory.
+#   - torch.cuda.mem_get_info lies while the loader is reading (page cache
+#     counts as used), which is why the boot guard needs an explicit valve.
+# ============================================================================
+
+services:
+  glm53-moet:
+    image: vllm-moet-glm53:combined
+    container_name: glm53-moet
+    # "no", NOT "unless-stopped": during bring-up an auto-restart loop resets
+    # the tensor counters every cycle and masks the real error message.
+    restart: "no"
+    ipc: host
+    # mem_limit is kept, but do NOT rely on it here - MEASURED 2026-08-29:
+    # during a GLM-5.3-Flash load `docker stats` reported 9.57 GiB / 100 GiB
+    # for this container while the HOST was at 118 GB used and Shmem was
+    # 51 MB. The allocations that run away go through the NVIDIA driver on
+    # unified memory and are not charged to the container's cgroup, so no
+    # limit value protects the box. Raising it to 110/115g changes nothing.
+    #
+    # What does protect the box is deploy/gb10-glm53/hostguard.py, armed
+    # BEFORE this container: a resident process that reads /proc/meminfo and
+    # kills through the docker socket without forking. memguard.sh cannot do
+    # this job either - it shells out per check, and once the box thrashes it
+    # is not scheduled (it slept through two wedges today).
+    mem_limit: 100g
+    ports:
+      - "8000:8000"
+    volumes:
+      # Stock FP8 checkpoint (~306 GiB). Downloaded separately; the container
+      # starts fully offline (see env below).
+      - /mnt/adata/ai/models/glm-5.3-flash:/model:ro
+      # torch.compile / cudagraph caches - persist across restarts.
+      - /mnt/adata/ai/models/glm-5.3-flash-cache:/root/.cache
+      # Persistent planes cache (quantization results). After the first boot
+      # every later boot LOADER-SKIPs the checkpoint entirely: no staging, no
+      # requant. Sequential I/O - a slower (USB/SATA) disk is fine here.
+      - /mnt/adata/ai/models/glm-5.3-flash-packs:/packs
+      # FP4 delta-tier pack. Random reads at serve time (gate promotions) -
+      # this one belongs on the INTERNAL NVMe.
+      - /var/lib/glm53-packs-nvme:/packs-nvme
+      # LATKA SWIGLU (SWIGLU_PATCH=1): podmienia moe_w2_cubit.py na wersje,
+      # ktora czyta swiglu_limit takze z layer.moe_config. Bez niej klamra
+      # 10.0 deklarowana przez checkpoint znika po cichu na sciezce ekspertow.
+      # Montowana, a nie wbudowana w obraz - zeby dalo sie zrobic A/B.
+      - ${SWIGLU_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py:ro
+      - ${DELTA_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py:ro
+      - ${PROPOSER_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py:ro
+      - ${V2RUNNER_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
+    environment:
+      # >>> EKSPERYMENT ODZYSKIWANIA JAKOSCI (2026-08-30) <<<
+      # Hooki delta tier i bramki pewnosci sa zainstalowane w runnerze V1
+      # (potwierdzone: 15 odwolan do moe_w2_delta/moe_w2_gate w
+      # gpu_model_runner.py w obrazie), a silnik domyslnie wybiera V2.
+      # config/vllm.py:630 czyta te zmienna PIERWSZA i zwraca ja wprost,
+      # omijajac cala logike wymuszania - wiec to jedyny przelacznik.
+      # RYZYKO: V2 powstal m.in. dla modeli hybrydowych z wieloma grupami
+      # KV, a ten model taki jest. Dlatego testujemy V1 NAJPIERW na samej
+      # bazie 2-bit (DELTA_GB=0), zanim wydamy godziny na przebudowe cache.
+      - VLLM_USE_V2_MODEL_RUNNER=${USE_V2:-0}
+      # Estymator pamieci grafow CUDA rezerwuje ekwiwalent ~4.9 GiB budzetu
+      # (log: "--gpu-memory-utilization=0.9100 is equivalent to 0.8696"),
+      # podczas gdy grafy ZMIERZONE zajmuja 0.23-0.25 GiB. Na tym boksie ta
+      # rezerwa jest roznica miedzy "pula FP4 sie miesci" a "KV = -1.01 GiB".
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=${CG_EST:-0}
+      # BF12: BEZSTRATNE 12-bitowe upakowanie reszty BF16 (projekcje uwagi,
+      # shared experts, dense MLP, indexer DSA, bramki routera). 12.05 bit/wage,
+      # bit-w-bit, weryfikowane przy kazdym boocie. Na GLM sama KDA to 9.4 GB
+      # BF16, wiec to ~2.4 GiB odzyskane BEZ kosztu jakosci.
+      - VLLM_MOE_W2_BF12=${BF12:-0}
+      # Zgoda na czesciowe podniesienia bramki, gdy pula < FIRE FLOOR
+      # (na tym boksie floor to 12.8 GiB, a miesci sie ~2 GiB).
+      - VLLM_MOE_W2_FORCE_POOL=${FORCE_POOL:-0}
+      # --- vLLM-Moet core ---
+      - VLLM_MOE_W2=1                  # 2-bit expert planes. Without it the
+                                       #   306 GiB of experts cannot fit at all.
+      # STAGE 1: FP4 delta tier OFF. Its per-step lifecycle
+      # (wait_manager_idle / step_end) is driven from the runner, and this
+      # build carries those hooks in the V1 runner only - vLLM 0.29 selects
+      # the V2 runner for this model ("Using V2 Model Runner" in the log).
+      # Running the tier with nobody calling step_end accumulates pins until
+      # it silently stops promoting, and nobody calling wait_manager_idle
+      # lets background residency commits overlap graph readers. Bare 2-bit
+      # is the honest configuration until the hooks are ported to V2.
+      - VLLM_MOE_W2_DELTA_GB=${DELTA_GB:-0}
+      # EXPLICIT layer count, for the same reason DELTA_GB is explicit. The
+      # W2 cutoff normally reads num_hidden_layers through get_text_config(),
+      # which handles this composite VLM config correctly - but its failure
+      # mode is a SILENT fallback to 43 (the DS4 layout). On a 45-layer model
+      # that would send layers 43-44 down the stock FP8 path: ~13.5 GiB more
+      # memory and a quietly mixed-precision stack, with only an error line to
+      # notice. Upstream logged this exact class of bug on 78-layer GLM-5.2.
+      # 46, NIE 45: obejmuje takze warstwe 45, czyli glowice MTP. Upstream
+      # celowo zostawia drafter nieskwantyzowany (jego liczby akceptacji byly
+      # mierzone tak wlasnie), ale w GLM-5.3-Flash ta glowica to PELNA warstwa
+      # MoE z wlasnymi 288 ekspertami. Zmierzone z indeksu checkpointu:
+      # 6.75 GiB eksperci + 0.23 GiB reszta = 6.98 GiB w FP8, wobec 1.90 GiB
+      # w planach 2-bit. Roznica +5.08 GiB.
+      #
+      # ZWERYFIKOWANE 2026-08-29 - 2-bitowy drafter NIE psuje akceptacji:
+      #   Java gettery/settery  AL 3.86 / 4.00 = 96.5% sufitu (p0=98 p1=96 p2=91)
+      #   przepisanie tekstu    AL 3.69          (p0=100%)
+      #   kod, bisect           AL 3.62          (p0=100%)
+      # Uszkodzony drafter nie dobija do 96.5% sufitu teoretycznego. Rozrzut
+      # akceptacji miedzy promptami (p0 od 100% do 62%) idzie za ENTROPIA
+      # TRESCI, nie za precyzja - kara od kwantyzacji bylaby stala.
+      #
+      # Nie da sie zreszta tego cofnac: przy 46 warstwach W2 budzet to
+      # 103.5 GiB wag + 7.5 aktywacji + 0.25 grafow + 4.6 KV = 115.8 z 115.55
+      # dostepnych. Oddanie glowicy do FP8 (+5.08) zostawia na KV -0.76 GiB
+      # przy k=3 i -0.36 przy k=2, czyli serwer nie wstanie w ogole. Wybor
+      # nigdy nie brzmial "drafter 2-bit czy FP8", tylko "drafter 2-bit czy
+      # ZADNEJ spekulacji" - a spekulacja daje tu +100% (11.4 -> 22-26 tok/s).
+      # Konceptualnie zreszta akceptacja mierzy ZGODNOSC Z CELEM, a cel jest
+      # sam 2-bitowy; drafter FP8 modelowalby model, ktorego nie uruchamiamy.
+      # 46 = glowica MTP tez idzie na 2-bit; 45 = zostaje w natywnym FP8
+      # (+5.08 GiB, ale drafter jest wtedy wierniejszy - do zmierzenia).
+      - VLLM_MOE_W2_NUM_LAYERS=${W2_LAYERS:-46}
+      # >>> THE unified-memory fix: FP4 tier host store on NVMe, not pinned RAM.
+      - VLLM_MOE_W2_STORE_DIR=/packs-nvme
+      # Persistent quantization cache -> LOADER-SKIP on every boot after the first.
+      - VLLM_MOE_W2_PLANES_CACHE=/packs/${PLANES_DIR:-planes-cache}
+      # STAGE 1: confidence gate OFF, same reason as the delta tier above -
+      # its promote -> re-forward loop lives in the runner hooks, which this
+      # build installs in V1 while the engine runs V2. It also has nothing to
+      # promote with the delta tier off. Quality on bare 2-bit is expected to
+      # be the weak point (upstream measured bare 2-bit degenerating), so
+      # this stage answers "does it load and generate", not "is it good".
+      - VLLM_MOE_W2_GATE=${GATE:-0}
+      # The resident-fit boot guard reads torch.cuda.mem_get_info, which on
+      # unified memory counts the loader's page cache as "used" and cannot see
+      # that the explicit pool above is already allocated. This is the code's
+      # documented consent valve; a real shortfall still fails as a plain OOM.
+      - VLLM_MOE_W2_FORCE_RESIDENT=1
+      # Gate telemetry: per-fire trace + KPI. Cheap, and the single most
+      # valuable diagnostic during bring-up (on DS4 these lines exposed a
+      # 38%-fire-rate pathology that cost half the decode rate).
+      - VLLM_MOE_W2_GATE_TRACE=1
+      - VLLM_MOE_W2_KPI_EVERY=100
+      # Telemetria puli FP4 (moe_w2_delta): 1 = okresowe podsumowanie
+      # pokrycia + HISTOGRAM PER WARSTWA, 2 = linia na kazda promocje.
+      # Domyslnie 0, bo w normalnej pracy to czysty koszt logow. Wlaczamy,
+      # gdy trzeba odpowiedziec "czy TA warstwa w ogole dostaje sloty".
+      - VLLM_MOE_W2_DELTA_TRACE=${DELTA_TRACE:-0}
+      - VLLM_MOE_W2_DELTA_TRACE_EVERY=${DELTA_TRACE_EVERY:-64}
+      # Pelna mapa precyzji (ktory ekspert jest FP4) jako JSON przy kazdym
+      # podsumowaniu - zapis atomowy, da sie tailowac.
+      - VLLM_MOE_W2_DELTA_DUMP=${DELTA_DUMP:-}
+      # Live-tunable gate knobs (mtime-cached, re-read on change): sweep tau /
+      # promote budget on a warm server, no restarts. Start at the upstream
+      # defaults (0.60 / 64) - they are a deliberate quality-first operating
+      # point, see docs/quality.md#gate-operating-point.
+      - VLLM_MOE_W2_GATE_TAU_FILE=/packs-nvme/knobs/tau.txt
+      - VLLM_MOE_W2_GATE_MAX_PROMOTE_FILE=/packs-nvme/knobs/max_promote.txt
+      # Fused unpermute (Triton): skips the fp32 zero+scatter buffers per layer
+      # per chunk. Worth ~a third of the DS4 prefill win on this box.
+      - VLLM_MOE_W2_FUSED_UNPERMUTE=1
+      # Return allocator segments eagerly - on unified memory every retained
+      # buffer is real silicon.
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # --- startup hygiene: zero network = zero silent hangs ---
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - HF_HUB_DISABLE_XET=1
+      - TOKENIZERS_PARALLELISM=false
+      - VLLM_API_KEY=${VLLM_API_KEY:-change-me}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120m               # the first boot quantizes 311e9 expert
+                                       #   parameters - no watchdog may kill it
+    command:
+      - "--model=/model"
+      - "--served-model-name"
+      - "glm-5.3-flash"
+      # Reasoning and tools per the vendor recipe for this checkpoint. Thinking
+      # is ALWAYS on for GLM-5.3-Flash (the generation prompt opens <think>
+      # unconditionally); depth is chosen per request with reasoning_effort
+      # low|high|max, defaulting to max. For agent use pass "low" or "high"
+      # explicitly, and clear_thinking=true in chat scenarios.
+      - "--reasoning-parser=glm45"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser=glm47"
+      - "--host=0.0.0.0"
+      - "--port=8000"
+      - "--trust-remote-code"
+      - "--load-format=safetensors"
+      # LOADER: plain safetensors, NOT the Run:ai streamer.
+      #
+      # Upstream uses the streamer on GB10 because the default loader mmaps
+      # every shard and never releases the mappings - fatal when the staged
+      # checkpoint is bigger than memory. That reasoning does not survive the
+      # streaming plane build: with STREAM-BUILD each layer is requantized as
+      # its last tensor lands and its staging is freed immediately, so what
+      # mmap leaves behind is page cache, which the kernel can reclaim - not
+      # anonymous allocations, which it cannot.
+      #
+      # And the streamer actively breaks the streaming build here. This
+      # checkpoint is layer-major (measured from the index: at most TWO
+      # layers span any shard boundary, so peak staging should be ~14 GiB),
+      # yet the streamer completed layer 32 while the progress counter read
+      # 14% - it does not walk the shards in order. Every layer it touches
+      # early materializes a ~7.2 GiB staging buffer that then waits for its
+      # remaining tensors, and memory hits 121 GiB with a single layer built.
+      # Reading shard-by-shard keeps the in-flight set at the two layers the
+      # file layout actually implies.
+      # NOT fp8: on this model that selects the `fp8_ds_mla` cache format,
+      # whose kernel asserts `pe_dim == 64`. GLM-5.3-Flash is NoPE
+      # (qk_rope_head_dim: 0), so it dies at the first KV write:
+      #   RuntimeError: concat_and_cache_mla ... pe_dim must be 64 for
+      #   fp8_ds_mla
+      # The cost of BF16 KV here is trivial and worth stating, because on
+      # DS4 it would not be: only 12 of 45 layers keep a growing cache, at
+      # kv_lora_rank 512 and no rope half, so ~12 KB/token - about 1.6 GiB
+      # for the full 128K window. The other 33 layers are KDA, whose
+      # recurrent state does not grow with context at all.
+      # MUST be bfloat16 spelled out - "auto" is NOT neutral here.
+      # _canonicalize_sparse_mla_kv_cache_dtype rewrites auto|fp8|fp8_e4m3 to
+      # `fp8_ds_mla` whenever the backend is FLASHINFER_MLA_SPARSE_SM120, and
+      # that format's kernel asserts pe_dim == 64. GLM-5.3-Flash is NoPE
+      # (qk_rope_head_dim: 0), so it dies at the first KV write:
+      #   RuntimeError: concat_and_cache_mla ... pe_dim must be 64 for
+      #   fp8_ds_mla
+      # Naming bfloat16 explicitly is the only way past the rewrite. (Same
+      # shape of trap as the Qwen3.8 checkpoint that self-selects fp8 KV.)
+      #
+      # The cost is small on this model and would not be on DS4: only 12 of
+      # 45 layers keep a growing cache (kv_lora_rank 512, no rope half), so
+      # ~12 KB/token - roughly 1.6 GiB for a full 128K window. The other 33
+      # layers are KDA, whose recurrent state does not grow with context.
+      # Back to fp8 once FlashInfer 0.6.18 is in the image: the backend
+      # normalizes this to `fp8_ds_mla` regardless (see
+      # _canonicalize_sparse_mla_kv_cache_dtype), and 0.6.18 is the release
+      # that handles a NoPE model there. bfloat16 is NOT a fallback - it
+      # leaves no valid backend at all for head_size=512.
+      # fp8 i backend AUTO - overlay NoPE (patche sm120 z issue #53963) sprawia,
+      # ze FLASHINFER_MLA_SPARSE_SM120 obsluguje ten model: dopycha 512-wymiarowy
+      # latent zerami do geometrii 576 GLM_NSA. `--kv-cache-dtype fp8` jest
+      # WYMAGANE - ta sciezka przyjmuje wylacznie spakowany uklad fp8_ds_mla,
+      # a bf16 KV nie ma na tej architekturze kernela w ogole.
+      - "--kv-cache-dtype=fp8"
+      - "--block-size=256"
+      # 128K to start. KV is not the binding constraint on this model (12 MLA
+      # layers at 512 elements/token, 34 KDA layers with constant state), so
+      # the ceiling is prefill time; raise once prefill is measured.
+      # 64K, nie 128K: z wlaczonym MTP drafter zjada zapas i na KV zostaje
+      # 1.18 GiB, a 128K wymaga 1.7 GiB ("To serve at least one request with
+      # the model's max seq len..."). KV jest tu tanie (12 z 45 warstw ma
+      # rosnacy cache), wiec 64K miesci sie z zapasem. Bez MTP mozna wrocic
+      # do 128K - patrz wariant bez --speculative-config.
+      # Wieza wizyjna profiluje sie z budzetem 32242 tokenow i jednym filmem
+      # o maksymalnym rozmiarze - przy testach jakosci tekstu to czysty koszt.
+      # Zerowanie limitow zdejmuje ten szczyt aktywacji.
+      - "--limit-mm-per-prompt"
+      - '{"image":${MM_IMG:-1},"video":${MM_VID:-1}}'
+      - "--max-model-len=${MAX_LEN:-65536}"
+      - "--gpu-memory-utilization=${UTIL:-0.93}"
+      - "--max-num-seqs=2"
+      # Prefill on this box is weight-read-bound, so the chunk scales roughly
+      # linearly (measured on DS4: 512 -> ~250 tok/s, 4096 -> 753 tok/s).
+      - "--max-num-batched-tokens=${MNBT:-2048}"
+      - "--no-scheduler-reserve-full-isl"
+      - "--tensor-parallel-size=1"
+      # MTP draft depth. Sweepowalne bez edycji tego pliku: MTP_K=3 docker
+      # compose up -d. ZMIERZONE na tym boksie 2026-08-29 (gx10/tools/
+      # bench_mtp.py, temp 0, powtarzalne co do 0.1 tok/s):
+      #
+      #   krok decode:  k=2 -> 121.0 ms    k=3 -> 139.1 ms   (+18.1 ms/poziom)
+      #   kod (bisect): k=2 -> 23.6 tok/s  k=3 -> 26.3 tok/s  (+11.3%)
+      #   kod (LRU):    k=2 -> 22.3        k=3 -> 23.7        (+6.5%)
+      #   kod+opis SQL: k=2 -> 18.9        k=3 -> 17.9        (-5.1%)
+      #   proza:        k=2 -> 16.1        k=3 -> 15.1        (-5.9%)
+      #
+      # Czas kroku jest PLASKI w obrebie zestawu promptow (121.0 ms +/-1% dla
+      # wszystkich czterech przy k=2, 139 ms przy k=3), wiec tok/s = AL /
+      # czas_kroku i caly wybor k sprowadza sie do jednej nierownosci: poziom
+      # k+1 oplaca sie wtedy i tylko wtedy, gdy podnosi AL bardziej niz krok.
+      # Z 18.1 ms na poziom prog dla k=3 wynosi +15% AL, dla k=4 +13%.
+      # UWAGA: stala NIE jest uniwersalna - inny ksztalt zadania (kod pisany
+      # na podstawie dlugiego tekstu) mierzy sie stabilnie na 126.5 ms przy
+      # tym samym k. Porownania k rob ZAWSZE na tym samym zestawie promptow;
+      # tak byly robione te powyzej (i powtorzone na cieplym serwerze co do
+      # 0.1 tok/s).
+      #
+      # PRAKTYCZNA REGULA: patrz na p0 z /metrics. p0 >= 91% -> k=3 wygrywa
+      # (AL rosnie o 23-28%); p0 <= 74% -> k=3 przegrywa (AL rosnie tylko
+      # o 8-10%). Akceptacja zalezy od TRESCI, nie od k.
+      #
+      # k=4 NIE oplaca sie - zmierzony zanik warunkowej akceptacji to 0.823
+      # na poziom, wiec projekcja daje +0.3% na najlepszym promptcie i -2 do
+      # -9% na reszcie (gx10/tools/mtp_predict.py). Karta modelu sugeruje 5,
+      # ale to liczba dla maszyn, gdzie drafter jest tani wzgledem weryfikacji;
+      # tutaj glowica MTP to pelna warstwa MoE i kosztuje 15% kroku.
+      #
+      # max-num-seqs 2 x (k+1) = 6 przy k=2, 8 przy k=3 - grubo ponizej progu
+      # 64, za ktorym decode spada ze specjalizowanego kernela FlashInfera.
+      # KV nie jest wiazaniem, ale k=3 kosztuje 0.68 GiB szczytu aktywacji
+      # (6.83 -> 7.51 GiB), przez co KV spada 4.95 -> 4.57 GiB, czyli
+      # 262 144 -> 214 252 tokenow (concurrency 4.00x -> 3.27x przy 64K).
+      # MTP wylaczalne: przy testach jakosci jest zbedny, a jego szczyt
+      # aktywacji (7.51 GiB przy k=3) konkuruje o budzet z pula FP4.
+      # Bramka dziala i bez niego: warunek to "spec_decode_metadata is not
+      # None LUB max_num_scheduled_tokens <= 1", a czysty decode spelnia drugi.
+      - "--speculative-config"
+      - '{"method":"mtp","num_speculative_tokens":${MTP_K:-3}}'
+      # Tryb grafow CUDA sterowalny: przy wlaczonej puli FP4 odtwarzanie
+      # pelnego grafu konczy sie illegal memory access (promocje mutuja
+      # slot_table pod czytelnikiem grafu). CG_MODE=NONE izoluje ten watek.
+      - "--compilation-config"
+      - '{"cudagraph_mode":"${CG_MODE:-FULL_AND_PIECEWISE}","custom_ops":["all"]}'

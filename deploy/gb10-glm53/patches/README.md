@@ -27,6 +27,9 @@ cp llm_base_proposer.orig.py llm_base_proposer.py
 python3 patch_mtp_token.py    llm_base_proposer.py
 cp v2_model_runner.orig.py v2_model_runner.py
 python3 patch_v2_runner.py    v2_model_runner.py
+docker cp $CID:$D/platforms/cuda.py                                         cuda_platform.orig.py
+cp cuda_platform.orig.py cuda_platform.py
+python3 patch_pdl_off.py      cuda_platform.py    # przelacznik VLLM_DISABLE_PDL
 ```
 
 Każdy skrypt jest idempotentny (sprawdza swój znacznik) i waliduje składnię.

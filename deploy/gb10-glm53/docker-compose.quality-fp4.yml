@@ -85,6 +85,8 @@ services:
       - ${DELTA_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py:ro
       - ${PROPOSER_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py:ro
       - ${V2RUNNER_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
+      # LATKA 6: przelacznik VLLM_DISABLE_PDL (patrz patches/patch_pdl_off.py)
+      - ${CUDAPLAT_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/platforms/cuda.py:ro
     environment:
       # >>> EKSPERYMENT ODZYSKIWANIA JAKOSCI (2026-08-30) <<<
       # Hooki delta tier i bramki pewnosci sa zainstalowane w runnerze V1
@@ -179,6 +181,10 @@ services:
       # pokrycia + HISTOGRAM PER WARSTWA, 2 = linia na kazda promocje.
       # Domyslnie 0, bo w normalnej pracy to czysty koszt logow. Wlaczamy,
       # gdy trzeba odpowiedziec "czy TA warstwa w ogole dostaje sloty".
+      # PDL (Programmatic Dependent Launch): vLLM wlacza go dla major>=9,
+      # czyli takze na sm_121, gdzie nikt go nie walidowal. Dotyka
+      # FusedRMSNormGated w 34 warstwach KDA. 1 = zgas (wymaga LATKI 6).
+      - VLLM_DISABLE_PDL=${DISABLE_PDL:-0}
       - VLLM_MOE_W2_DELTA_TRACE=${DELTA_TRACE:-0}
       - VLLM_MOE_W2_DELTA_TRACE_EVERY=${DELTA_TRACE_EVERY:-64}
       # Pelna mapa precyzji (ktory ekspert jest FP4) jako JSON przy kazdym

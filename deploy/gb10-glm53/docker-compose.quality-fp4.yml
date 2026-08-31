@@ -185,6 +185,17 @@ services:
       # czyli takze na sm_121, gdzie nikt go nie walidowal. Dotyka
       # FusedRMSNormGated w 34 warstwach KDA. 1 = zgas (wymaga LATKI 6).
       - VLLM_DISABLE_PDL=${DISABLE_PDL:-0}
+      # Budzet promocji puli FP4 na tik (_PROMOTE_PER_TICK, domyslnie 8).
+      # ZMIERZONE 2026-08-31: przy 8 pula wymienia sie w CALOSCI co 32 tiki
+      # i czyta 41.7 GiB z pakietu w 2 minuty dekodowania. 0 = zamrozenie
+      # puli po zapelnieniu (izoluje koszt karuzeli od kosztu samej sciezki).
+      - VLLM_MOE_W2_DELTA_PROMOTE=${DELTA_PROMOTE:-8}
+      # Histereza promocji (regula colibri "25%+4"): kandydat wypycha
+      # z PELNEJ puli tylko wtedy, gdy jego czestosc przekracza
+      # h * (czestosc najslabszej ofiary) + 4. Upstream domyslnie 0 = OFF,
+      # a komentarz w kodzie opisuje dokladnie patologie, ktora zmierzylismy:
+      # ping-pong promocji perturbujacy tiery w srodku dekodowania.
+      - VLLM_MOE_W2_PROMO_HYST=${PROMO_HYST:-0}
       - VLLM_MOE_W2_DELTA_TRACE=${DELTA_TRACE:-0}
       - VLLM_MOE_W2_DELTA_TRACE_EVERY=${DELTA_TRACE_EVERY:-64}
       # Pelna mapa precyzji (ktory ekspert jest FP4) jako JSON przy kazdym

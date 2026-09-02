@@ -124,6 +124,37 @@ def _get_kv_cache_groups_glm5_next(
 assert src.count(OLD_DEF) == 1
 src = src.replace(OLD_DEF, NEW_DEF)
 
+# --- 3. zdejmij page_size_padded, ktore stempluje galaz skip-quant ---------
+# `--kv-cache-dtype-skip-layers sliding_window` jest KONIECZNE: bez niego
+# warstwy SWA draftera dziedzicza fp8_ds_mla, a zaden backend SWA na sm_121
+# tego nie obsluguje (ValueError: No valid attention backend ... FLASH_ATTN:
+# FP8 KV cache requires FA3 on SM90 or FA4 on SM100). Ale ta galaz
+# (platforms/interface.py -> cache_config.skip_page_size_padded, potem
+# Attention.get_kv_cache_spec) stempluje spec draftera page_size_padded =
+# strona MLA i blok 64, a klasyfikator overlayu odrzuca kazdy padded spec
+# ("a drafter group must never be padded") -> generic path -> assert w warmup.
+# Padding jest tu bez znaczenia: drafter dostaje wlasne tensory (standalone),
+# wiec zdejmujemy go PRZED jakakolwiek arytmetyka geometrii.
+OLD_PARTITION = """\
+    draft_specs = {
+        k: v for k, v in kv_cache_spec.items() if type(v) is SlidingWindowSpec
+    }
+"""
+NEW_PARTITION = """\
+    draft_specs = {
+        k: v for k, v in kv_cache_spec.items() if type(v) is SlidingWindowSpec
+    }
+    # [PATCH-DRAFT-SMALL-BLOCK] skip-quant (--kv-cache-dtype-skip-layers)
+    # stamps these specs with page_size_padded == the MLA page; the drafter
+    # gets standalone tensors here, so the padding is meaningless and would
+    # only trip the never-padded guard below. Strip it before any geometry.
+    draft_specs = {
+        k: replace(v, page_size_padded=None) for k, v in draft_specs.items()
+    }
+"""
+assert src.count(OLD_PARTITION) == 1, "kotwica partycji draftera (overlay) nie znaleziona"
+src = src.replace(OLD_PARTITION, NEW_PARTITION)
+
 ast.parse(src)
 open(path, "w", encoding="utf-8").write(src)
 print("OK: maly blok draftera (LATKA 8) nalozony na", path)

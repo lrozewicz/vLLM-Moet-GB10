@@ -340,6 +340,11 @@ services:
       - "--max-num-batched-tokens=${MNBT:-2048}"
       - "--no-scheduler-reserve-full-isl"
       - "--tensor-parallel-size=1"
+      # DFlash2 WYMAGA dodatkowo `--kv-cache-dtype-skip-layers=sliding_window`
+      # (KV draftera w bf16: warstwy SWA nie maja na sm_121 backendu dla
+      # fp8_ds_mla). Flagi nie da sie tu sparametryzowac - pusta wartosc
+      # parsuje sie do [""] i wlacza logike padded-spec dla wszystkich - wiec
+      # boot.sh (DFLASH=1) dokleja ja do tymczasowej kopii tego pliku.
       # MTP draft depth. Sweepowalne bez edycji tego pliku: MTP_K=3 docker
       # compose up -d. ZMIERZONE na tym boksie 2026-08-29 (gx10/tools/
       # bench_mtp.py, temp 0, powtarzalne co do 0.1 tok/s):

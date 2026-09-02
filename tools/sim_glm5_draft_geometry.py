@@ -35,6 +35,8 @@ ap.add_argument("--window", type=int, default=2048)
 ap.add_argument("--avail-gib", type=float, default=6.0)
 ap.add_argument("--max-len", type=int, default=204800)
 ap.add_argument("--mnbt", type=int, default=2048)
+ap.add_argument("--padded", action="store_true",
+                help="spec draftera tak, jak go stempluje skip-quant: blok 64 + page_size_padded = strona MLA")
 args = ap.parse_args()
 
 vllm_config = SimpleNamespace(
@@ -63,8 +65,10 @@ for i in range(11):
 draft_dtype = getattr(torch, args.draft_dtype)
 for i in range(5):
     spec[f"drafter.layers.{i}.attn"] = SlidingWindowSpec(
-        block_size=args.mla_block, num_kv_heads=args.draft_kv_heads, head_size=128,
+        block_size=64 if args.padded else args.mla_block,
+        num_kv_heads=args.draft_kv_heads, head_size=128,
         dtype=draft_dtype, sliding_window=args.window,
+        page_size_padded=(args.mla_block * args.mla_bytes) if args.padded else None,
     )
 
 groups = K._get_kv_cache_groups_glm5_next(vllm_config, spec)

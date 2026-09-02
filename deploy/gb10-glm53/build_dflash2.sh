@@ -33,6 +33,7 @@ for f in qwen3_dflash2.py dflash2/__init__.py dflash2/speculator.py \
   [ -s "$WORK/overlay/$f" ] || curl -fsSL "$UP/$f" -o "$WORK/overlay/$f"
 done
 cp "$REPO_ROOT/deploy/gb10-glm53/patches/patch_glm5_draft_small_block.py" "$WORK/overlay/"
+cp "$REPO_ROOT/deploy/gb10-glm53/patches/patch_skip_layers_kv_dtype.py" "$WORK/overlay/"
 cp "$REPO_ROOT/deploy/gb10-glm53/dflash2.dockerfile" "$WORK/Dockerfile"
 sed -i -E "s|^ARG BASE=.*|ARG BASE=${BASE}|" "$WORK/Dockerfile"
 

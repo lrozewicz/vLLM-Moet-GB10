@@ -18,14 +18,15 @@ COPY overlay/dflash2/ $VLLM/v1/worker/gpu/spec_decode/dflash2/
 COPY overlay/patch_registry_and_select.py /tmp/dflash2/
 # 2. glue GLM-5.3 (pobrane, nie wendorowane)
 COPY overlay/patch_glm_aux_capture.py overlay/patch_glm5_drafter_group.py /tmp/dflash2/
-# 3. nasza latka 8
-COPY overlay/patch_glm5_draft_small_block.py /tmp/dflash2/
+# 3. nasze latki 8 i 9
+COPY overlay/patch_glm5_draft_small_block.py overlay/patch_skip_layers_kv_dtype.py /tmp/dflash2/
 
 RUN set -e; cd /tmp/dflash2 \
     && python3 patch_registry_and_select.py \
     && python3 patch_glm_aux_capture.py \
     && python3 patch_glm5_drafter_group.py \
     && python3 patch_glm5_draft_small_block.py $VLLM/v1/core/kv_cache_utils.py \
+    && python3 patch_skip_layers_kv_dtype.py $VLLM/model_executor/layers/attention/attention.py \
     && python3 -c "from vllm.model_executor.models.registry import ModelRegistry; assert 'DFlash2DraftModel' in ModelRegistry.get_supported_archs(); print('DFlash2DraftModel zarejestrowany')" \
     && python3 -c "import inspect, vllm.v1.core.kv_cache_utils as k; s=inspect.getsource(k); assert 'DFLASH2-DRAFTER-GROUP' in s and 'PATCH-DRAFT-SMALL-BLOCK' in s; print('grupa draftera + maly blok OK')" \
     && python3 -c "import inspect, vllm.models.glm5next.nvidia.model as m; assert 'DFLASH2-AUX-CAPTURE' in inspect.getsource(m); print('aux capture OK')" \

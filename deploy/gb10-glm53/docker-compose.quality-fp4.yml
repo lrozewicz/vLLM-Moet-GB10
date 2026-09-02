@@ -200,6 +200,10 @@ services:
       # dflash2). Pusty = automat (najwiekszy dzielnik bloku MLA <= 1024,
       # wielokrotnosc 64 -> 1024 przy bloku 7168); 0 = blok modelu.
       - VLLM_GLM5_DRAFT_BLOCK=${DRAFT_BLOCK:-}
+      # dtype KV warstw pomijanych przez --kv-cache-dtype-skip-layers (LATKA 9,
+      # tylko obraz dflash2). auto = bf16 (jak upstream); fp8_e4m3 = KV
+      # draftera 2048 B/token -> +17% blokow puli.
+      - VLLM_KV_SKIP_LAYERS_DTYPE=${SKIP_KV_DTYPE:-auto}
       # Budzet promocji puli FP4 na tik (_PROMOTE_PER_TICK, domyslnie 8).
       # ZMIERZONE 2026-08-31: przy 8 pula wymienia sie w CALOSCI co 32 tiki
       # i czyta 41.7 GiB z pakietu w 2 minuty dekodowania. 0 = zamrozenie

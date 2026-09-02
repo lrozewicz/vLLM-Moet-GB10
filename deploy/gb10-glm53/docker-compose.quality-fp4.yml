@@ -43,7 +43,8 @@
 
 services:
   glm53-moet:
-    image: vllm-moet-glm53:combined
+    # IMAGE=vllm-moet-glm53:dflash2 -> obraz z drafterem DFlash2 (build_dflash2.sh)
+    image: ${IMAGE:-vllm-moet-glm53:combined}
     container_name: glm53-moet
     # "no", NOT "unless-stopped": during bring-up an auto-restart loop resets
     # the tensor counters every cycle and masks the real error message.
@@ -89,6 +90,10 @@ services:
       - ${CUDAPLAT_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/platforms/cuda.py:ro
       # LATKA 7: dtype stanu rekurencyjnego KDA (patches/patch_kda_ssm_dtype.py)
       - ${MAMBAUTILS_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/mamba_utils.py:ro
+      # Drafter DFlash2 (incoai/GLM-5.3-Flash-DFlash2, 2.2 GB, CC-BY-NC-ND):
+      # DRAFT_DIR=~/glm53-run/dflash2-draft SPEC_METHOD=dflash MTP_K=7
+      # SPEC_EXTRA=',"model":"/models/dflash2-draft"' IMAGE=vllm-moet-glm53:dflash2
+      - ${DRAFT_DIR:-/dev/null}:/models/dflash2-draft:ro
     environment:
       # >>> EKSPERYMENT ODZYSKIWANIA JAKOSCI (2026-08-30) <<<
       # Hooki delta tier i bramki pewnosci sa zainstalowane w runnerze V1
@@ -191,6 +196,10 @@ services:
       # rozmiar strony mamby, a przez nia strone attention (dzis 6912 tok.),
       # czyli staly podatek prefix-cache na ture agenta.
       - VLLM_KDA_SSM_DTYPE=${KDA_SSM:-}
+      # Blok KV draftera DFlash2 w trybie standalone (LATKA 8, tylko obraz
+      # dflash2). Pusty = automat (najwiekszy dzielnik bloku MLA <= 1024,
+      # wielokrotnosc 64 -> 1024 przy bloku 7168); 0 = blok modelu.
+      - VLLM_GLM5_DRAFT_BLOCK=${DRAFT_BLOCK:-}
       # Budzet promocji puli FP4 na tik (_PROMOTE_PER_TICK, domyslnie 8).
       # ZMIERZONE 2026-08-31: przy 8 pula wymienia sie w CALOSCI co 32 tiki
       # i czyta 41.7 GiB z pakietu w 2 minuty dekodowania. 0 = zamrozenie
@@ -372,7 +381,9 @@ services:
       # Bramka dziala i bez niego: warunek to "spec_decode_metadata is not
       # None LUB max_num_scheduled_tokens <= 1", a czysty decode spelnia drugi.
       - "--speculative-config"
-      - '{"method":"mtp","num_speculative_tokens":${MTP_K:-3}}'
+      # SPEC_METHOD=dflash + SPEC_EXTRA=',"model":"/models/dflash2-draft"' + MTP_K=7
+      # przelacza na drafter DFlash2 (blok 8 = 7 draftow + token celu).
+      - '{"method":"${SPEC_METHOD:-mtp}","num_speculative_tokens":${MTP_K:-3}${SPEC_EXTRA:-}}'
       # Tryb grafow CUDA sterowalny: przy wlaczonej puli FP4 odtwarzanie
       # pelnego grafu konczy sie illegal memory access (promocje mutuja
       # slot_table pod czytelnikiem grafu). CG_MODE=NONE izoluje ten watek.

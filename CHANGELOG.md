@@ -38,6 +38,12 @@ The what-and-why of each change against upstream is in
   - `tools/sim_glm5_draft_geometry.py`: runs the patched KV grouping on CPU
     inside the image with this box's geometry, `--padded` reproducing the
     skip-quant spec - one run instead of a 12-minute boot.
+  - `patches/patch_skip_layers_kv_dtype.py` + `patch_flashinfer_builder_dtype.py`
+    (patches 9/9b, knob `VLLM_KV_SKIP_LAYERS_DTYPE`): the drafter's KV can be
+    fp8 e4m3 instead of bf16. Measured: it computes correctly (acceptance
+    unchanged) but FlashInfer's fp8 path takes ~0.67 GiB of workspace, which
+    is what the smaller page saves - 83 pool blocks instead of 81. Default
+    stays `auto`.
   - Known cost: with `mamba_cache_mode=align` each of the 4 KDA groups holds
     `1 + k` pool blocks per request (one state per draft position), so k=7
     pins ~32 of 81 blocks per request. One 200K stream fits; two long streams

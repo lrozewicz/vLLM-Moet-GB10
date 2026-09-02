@@ -15,6 +15,35 @@ The what-and-why of each change against upstream is in
 
 ### Added
 
+- **DFlash2 speculative decoding for GLM-5.3-Flash on one GB10**
+  (`deploy/gb10-glm53/build_dflash2.sh` -> image `vllm-moet-glm53:dflash2`).
+  The model's MTP head is a full MoE layer, so at k=4 its four sequential
+  draft passes were ~46% of the decode step; the 1B block-diffusion drafter
+  (`incoai/GLM-5.3-Flash-DFlash2`, CC-BY-NC-ND) proposes a block of 8 in
+  one pass. Measured on the reference box, temperature 0, `reasoning_effort
+  low`: code **29.3 tok/s** vs 19.6 with MTP k=4 (+49%, acceptance length
+  5.3-5.9), prose 12.4 vs 11.5, prefill unchanged (~640 tok/s), HumanEval
+  pass@1 95.7%, a single 198K-token prompt served with zero preemptions.
+  - The overlay is tonyd2wild's port of vLLM PR #52816 for the same day-0
+    image; its GLM glue files carry no license, so the build script
+    downloads them into a gitignored directory (same rule as the NoPE overlay).
+  - `patches/patch_glm5_draft_small_block.py` (patch 8): at TP=1 the MLA
+    page is 656 B/token = 16 x 41, so the overlay's exact-fit drafter KV
+    mode can never apply; its standalone fallback would charge a 7168-token
+    drafter page per layer to every pool block (-58% KV capacity). The patch
+    gives the standalone drafter a 1024-token block (-16%) and strips the
+    `page_size_padded` that `--kv-cache-dtype-skip-layers=sliding_window`
+    stamps on the drafter spec (that flag is required: no SWA backend on
+    sm_121 accepts `fp8_ds_mla`).
+  - `tools/sim_glm5_draft_geometry.py`: runs the patched KV grouping on CPU
+    inside the image with this box's geometry, `--padded` reproducing the
+    skip-quant spec - one run instead of a 12-minute boot.
+  - Known cost: with `mamba_cache_mode=align` each of the 4 KDA groups holds
+    `1 + k` pool blocks per request (one state per draft position), so k=7
+    pins ~32 of 81 blocks per request. One 200K stream fits; two long streams
+    serialise, two 8K streams already preempt. For concurrent serving keep
+    the MTP image (`:combined`).
+
 - **GLM-5.3-Flash bring-up** (321B / 18B active, multimodal, hybrid KDA +
   NoPE sparse MLA). Not yet booted - no serving numbers here until it is.
   - `tools/apply_w2_overlay.py`: installs the 2-bit expert engine onto a vLLM

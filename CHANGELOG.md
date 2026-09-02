@@ -23,7 +23,7 @@ The what-and-why of each change against upstream is in
   one pass. Measured on the reference box, temperature 0, `reasoning_effort
   low`: code **29.3 tok/s** vs 19.6 with MTP k=4 (+49%, acceptance length
   5.3-5.9), prose 12.4 vs 11.5, prefill unchanged (~640 tok/s), HumanEval
-  pass@1 95.7%, a single 198K-token prompt served with zero preemptions.
+  pass@1 95.7% (97.0% with `reasoning_effort` high), a single 198K-token prompt served with zero preemptions.
   - The overlay is tonyd2wild's port of vLLM PR #52816 for the same day-0
     image; its GLM glue files carry no license, so the build script
     downloads them into a gitignored directory (same rule as the NoPE overlay).

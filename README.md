@@ -1,11 +1,52 @@
 # vLLM-Moet-GB10
 
-**Run DeepSeek-V4-Flash-0731 (304B MoE: 284B main model + 20B built-in DSpark speculator head) on a single NVIDIA GB10 box** - NVIDIA
-DGX Spark, ASUS Ascent GX10, and other GB10 systems with 121.6 GiB of unified
-memory. Measured: **~21 tok/s decode on code**, ~13 on sampled prose (the gap
-is how often the speculator guesses right), **256K context**, quality-recovering
-FP4 tier, tool calling and split reasoning for agent use. First boot ~35 min
-(one-time quantization); every boot after that ~10 min.
+**Frontier Mixture-of-Experts models on a single NVIDIA GB10 box** - NVIDIA
+DGX Spark, ASUS Ascent GX10 and other GB10 systems with 121.6 GiB of unified
+memory. Models whose checkpoints are two to three times larger than the
+machine's memory are served with vLLM at interactive speed. The routed
+experts become 2-bit planes computed by hand-written SASS kernels, and a
+runtime FP4 tier restores precision where it matters. Speculative decoding
+supplies the speed, and a set of fixes covers what unified memory breaks.
+
+## Supported models
+
+| model | size | decode, code | context | quality, measured | guide |
+|---|---|---:|---:|---|---|
+| **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** | 321B total / 18B active; FP8 checkpoint 306 GiB | **~29 tok/s** (DFlash2) | **200K** | HumanEval **97.0%** | [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md) |
+| **[DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)** | 304B (284B + 20B DSpark head); ~156 GB | ~21 tok/s (DSpark k=2) | 256K | [`docs/quality.md`](docs/quality.md) | [`docs/models/deepseek-v4-flash-0731.md`](docs/models/deepseek-v4-flash-0731.md) |
+
+Each guide covers what had to change for that model, what was measured, why
+the quality holds, and a step-by-step setup. Per-release history:
+[`CHANGELOG.md`](CHANGELOG.md) (latest: **v0.3.0**, GLM-5.3-Flash).
+
+## How it works
+
+The same engine serves every model; what differs per model is the vLLM base
+and the overlays needed to make that model run at all.
+
+- **2-bit expert planes** (upstream vLLM-Moet). The routed experts are ~97%
+  of a large MoE's parameters, and each token uses only a few of them. They
+  are stored as codes {-4, -1, 1, 4} times one scale per 32 weights, and
+  hand-written SASS GEMMs compute directly on them. Everything else
+  (attention, shared experts, dense layers, embeddings, router) keeps the
+  checkpoint's own precision.
+- **FP4 delta tier** (upstream). A pool of the hottest experts, served in FP4
+  instead of 2-bit and chosen at runtime from the actual routing. The full
+  FP4 copy lives on NVMe, and promotions read from it while the model serves.
+- **Persistent planes cache.** Quantization runs once, on the first boot;
+  every later boot loads the planes directly.
+- **Speculative decoding.** DSpark (DeepSeek's built-in head) for DS4, the
+  DFlash2 block-diffusion drafter for GLM-5.3-Flash.
+- **Unified-memory engineering** (this fork). Streaming plane builds, the FP4
+  store on NVMe instead of pinned host RAM, page-cache handling, memory
+  guards, and the runner hooks ported to vLLM's V2 model runner. The full
+  delta against upstream: [`docs/CHANGES-VS-UPSTREAM.md`](docs/CHANGES-VS-UPSTREAM.md).
+
+DeepSeek-V4-Flash-0731 runs on the official `vllm/vllm-openai:v0.24.0` image
+plus the generated patch. GLM-5.3-Flash needs vLLM code that exists only in
+the vendor `glm53-flash` image (0.29-dev), so there the engine is extracted
+from the same patch and installed onto that image
+([`tools/apply_w2_overlay.py`](tools/apply_w2_overlay.py)).
 
 ## Credit where credit is due
 
@@ -20,94 +61,33 @@ it). None of what is in this repo would exist without that work - thank you.
 If the upstream project accepts contributions again, everything here is
 offered back as patches.
 
-Upstream targets discrete-GPU boxes; this fork makes the same engine work on
-**GB10 unified memory**, where several of its entirely reasonable assumptions
-break. What changed and why: [`docs/CHANGES-VS-UPSTREAM.md`](docs/CHANGES-VS-UPSTREAM.md).
-Per-release history: [`CHANGELOG.md`](CHANGELOG.md).
+GLM-5.3-Flash on one box also stands on community work:
 
-## Measured results (ASUS Ascent GX10, GB10, 121.6 GiB unified, aarch64)
+- **[chriswritescode-dev/glm-5.3-flash-sm120](https://github.com/chriswritescode-dev/glm-5.3-flash-sm120)**
+  (from [vllm#53963](https://github.com/vllm-project/vllm/issues/53963)):
+  the NoPE sparse-MLA fix for consumer Blackwell. It zero-pads the 512-wide
+  latent into the existing 576-wide GLM_NSA geometry - exact, and no CUDA.
+  This is what unblocked the model on sm_12x.
+- **[tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark)**:
+  the DFlash2 overlay (a port of vLLM PR #52816) and its GLM glue.
+- **[incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)**:
+  the drafter itself (CC-BY-NC-ND-4.0, non-commercial).
+- **[darkdatter/gb10-repo](https://github.com/darkdatter/gb10-repo)**: the
+  HumanEval harness pattern and the lesson that on this hardware the drafter
+  is the largest single-stream lever.
 
-| metric | value |
-|---|---|
-| decode, code at temperature 0 (DSpark k=2) | **~21 tok/s** (n=6, 20.5-22.9); drafter acceptance 81%, 2.62 accepted tokens/step; the confidence gate fires on 2-4% of steps |
-| decode, sampled prose at temperature 1.0 | **~12.9 tok/s** (PL 12.8, EN 12.9); the gate fires on 12-14% of steps - its worst case, and what the tuning grid below was swept on |
-| decode, gate operating point | shipped default is tau=0.60/promote=64, [deliberately](docs/quality.md#gate-operating-point-why-we-stay-at-tau060--promote64); the cheap point (0.30/16) buys 22.6 tok/s on code and 15.6 PL / 17.5 EN on prose |
-| decode, no speculation | ~7.7-8 tok/s |
-| prefill | **~753 tok/s** on a 23.7K prompt (chunk 4096 + fused unpermute) |
-| context | 256K served (KV pool ~660K tokens; model is natively 1M - the ceiling is prefill time, not memory) |
-| first boot / later boots | ~35 min / **~10 min** (LOADER-SKIP from the planes cache: zero staging, zero requant) |
-| memory at serve | ~117/121.6 GiB used, PSI ~ 0 |
-
-Anti-recommendations (measured, resist the urge): **DSpark k=7** (the model
-card's suggestion) gives 5.1 tok/s, because positions 4-7 accept ~0% and
-seven sequential drafter passes eat the 273 GB/s of bandwidth - k=2 is the
-optimum here. **`deepseek_mtp`** is incompatible with the 0731 head
-architecture and fails at weight load.
+The NoPE overlay and the GLM glue carry no license, so this repository does
+not redistribute them: the build scripts download them at build time.
 
 ## Quick start
 
-Prerequisites: a GB10 box with the NVIDIA driver (tested: 580.159.03, CUDA
-13.0), docker + NVIDIA container toolkit, ~160 GB for the checkpoint, ~210 GB
-for the planes cache (any disk), ~135 GB on the **internal NVMe** for the FP4
-pack, and network access for the one-time downloads.
+Common prerequisites: a GB10 box with the NVIDIA driver (tested: 580.159.03,
+CUDA 13.0), docker with the NVIDIA container toolkit, network access for the
+one-time downloads, and the disk space listed in the model's guide. Then
+follow the guide of the model you want:
 
-```bash
-git clone https://github.com/lrozewicz/vLLM-Moet-GB10.git
-cd vLLM-Moet-GB10
-
-# 1. Build the serving image (~40 min first time; DeepGEMM compiles from source)
-docker build -f deploy/gb10/Dockerfile -t vllm-moet-gb10:latest .
-
-# 2. Download the stock checkpoint (~156 GB). Keep max workers low - high
-#    parallelism can DoS consumer routers (measured; see script comments).
-bash deploy/gb10/download_ds4_0731.sh /path/to/models/deepseek-v4-flash-0731
-
-# 3. Edit the volume paths at the top of the compose file, then:
-docker compose -f deploy/gb10/docker-compose.deepseek-v4-flash-0731.yml up -d
-
-# 4. (recommended for the first boot) arm the memory guard in a second shell -
-#    it stops the container on sustained memory pressure instead of letting a
-#    livelock force a hard reset:
-./deploy/gb10/memguard.sh deepseek-moet 8 60 20
-
-# 5. Watch progress:
-docker logs -f deepseek-moet | grep -E "moe_w2|Completed|startup complete"
-```
-
-First boot: you should see `moe_w2 STREAM-BUILD armed`, then
-`moe_w2: layer N planes built (1.69 GiB)` climbing to 43/43, then CUDA graph
-capture, then `Application startup complete`. Later boots print
-`moe_w2 LOADER-SKIP armed` and `layer N planes from cache` instead - that is
-the persistent cache doing its job.
-
-Smoke test:
-
-```bash
-curl -s http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer change-me" -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash-0731",
-       "messages":[{"role":"user","content":"Hello!"}],
-       "max_tokens":100, "temperature":1.0, "top_p":0.95,
-       "chat_template_kwargs":{"enable_thinking":false}}'
-```
-
-## Serving notes (agents, thinking, tools)
-
-- Two model aliases are served: `deepseek-v4-flash-0731` (chat) and
-  `deepseek-v4-flash-0731-think`. Thinking is a **per-request** toggle via
-  `chat_template_kwargs: {"enable_thinking": true|false}`; with
-  `--reasoning-parser=deepseek_v3` the chain of thought comes back in the
-  message's `reasoning` field (note: `reasoning`, not `reasoning_content`),
-  cleanly separated from `content`. This fork routes **every** `<think>`
-  block there, including ones the model reopens mid-answer, so agent clients
-  never see a raw `</think>` in the text.
-- Tool calling works out of the box (`--enable-auto-tool-choice
-  --tool-call-parser=deepseek_v4` - the DSML grammar of this checkpoint).
-- Sampling per the model card: `temperature=1.0`, `top_p=0.95` for agentic
-  use, `top_p=1.0` otherwise.
-- `reasoning_effort`: only `"max"` changes anything (injects the
-  maximum-deliberation preamble, thinking mode only). The official encoding's
-  default is `low` = empty prefix - you are already there.
+- **GLM-5.3-Flash** -> [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md#setup-step-by-step)
+- **DeepSeek-V4-Flash-0731** -> [`docs/models/deepseek-v4-flash-0731.md`](docs/models/deepseek-v4-flash-0731.md#quick-start)
 
 ## Unified-memory survival guide
 
@@ -124,85 +104,65 @@ Things that are true on GB10 and surprising coming from discrete GPUs:
    with your VRAM 1:1 here.
 4. **`torch.cuda.mem_get_info` lies during I/O.** Page cache from concurrent
    checkpoint reads counts as "used", so boot-time budget guards misfire -
-   hence the documented consent valves in the compose file.
-5. **A wedged box may still answer SSH's banner but never log you in.** Keep
-   `memguard.sh` armed during first boots; it kills the container at sustained
-   PSI before the point of no return.
-
-## DFlash status (help wanted)
-
-[RedHatAI/DeepSeek-V4-Flash-speculator.dflash](https://huggingface.co/RedHatAI/DeepSeek-V4-Flash-speculator.dflash)
-is a 2B parallel-drafting speculator with excellent numbers on its target.
-This fork contains the complete runtime support for running it against an MLA
-target - it boots, drafts and serves. However, the published speculator was
-trained against **base** `deepseek-ai/DeepSeek-V4-Flash`, whose weights differ
-from `-0731`, and acceptance does not transfer: measured on 0731 at k=7,
-**11.8%** on code at greedy (position 1: 45.7%, 1.82 accepted tokens/step) and
-**2.7%** on prose at temperature 1.0, against 41.6% / 78.8% / 3.9 on the base
-target. Two integration notes for anyone reproducing this: the published
-`config.json` leaves `target_hidden_size` at `null` (it needs `16384` for
-`hc_mult=4`, otherwise the fc is sized for a quarter of its input), and
-acceptance is strongly workload-dependent, so a single prose-at-temperature-1
-number understates the checkpoint by ~4x. The moment a 0731-trained DFlash
-speculator exists, this stack should hit ~2x the current decode. If you have
-the training capacity - the runtime is ready and we will gladly test.
-
-## GLM-5.3-Flash — serving on one GB10
-
-**[zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (321B
-total / 18B active, multimodal, hybrid KDA + NoPE sparse MLA) now answers on a
-single GX10. First measured decode: **11.4 tok/s** on code, no speculation yet.
-
-Two independent blockers had to fall, and only one was ours:
-
-- **Size** — 306 GiB of FP8 experts cannot fit in 121.6 GiB. The W2 engine
-  brings them to ~96 GiB of 2-bit planes. Getting the FP8 path there exposed
-  four gaps that only matter on unified memory (streaming build, allocator
-  release, and both halves of the planes cache); details in
-  [`docs/GLM-5.3-FLASH.md`](docs/GLM-5.3-FLASH.md).
-- **Attention** — this checkpoint is NoPE (`qk_rope_head_dim: 0`) and consumer
-  Blackwell has no sparse-MLA backend for that shape. Solved by
-  **[chriswritescode-dev/glm-5.3-flash-sm120](https://github.com/chriswritescode-dev/glm-5.3-flash-sm120)**
-  (from [vllm#53963](https://github.com/vllm-project/vllm/issues/53963)): zero-pad
-  the 512-wide latent into the existing 576-wide GLM_NSA geometry. Exact, and
-  no CUDA. That work is theirs and it is what unblocked this.
-
-Their overlay is verified on 4x RTX PRO 6000; this fork contributes the half
-that makes the model fit on **one** box. Build both:
-
-```bash
-./deploy/gb10-glm53/build_combined.sh
-```
-
-It fetches their Dockerfile at build time rather than vendoring it — their repo
-carries no LICENSE, so redistribution is not ours to do.
-
-One finding worth flagging beyond this model: **the confidence gate's replay is
-not safe on hybrid models as written.** 34 of this model's 45 layers are KDA
-linear attention, which advance a recurrent state in place — replaying a step
-advances it twice and silently corrupts the sequence, where on DS4's
-all-attention stack the same replay is idempotent. The overlay snapshots and
-rewinds that state around a replay.
+   hence the documented consent valves in the compose files.
+5. **Page cache blocks the next boot.** vLLM's start-up check effectively
+   compares `MemFree`, not `MemAvailable`, with the memory it wants. A boot
+   that reads a 300 GB checkpoint leaves tens of GiB of page cache behind,
+   and the next boot fails. `posix_fadvise(DONTNEED)` on the files releases
+   it without root ([`drop_page_cache.py`](deploy/gb10-glm53/drop_page_cache.py),
+   measured +43.6 GiB).
+6. **`docker`'s `mem_limit` does not protect the host.** Measured during a
+   GLM load: the container's cgroup reported 9.6 GiB while the host had
+   118 GB in use - GPU allocations go through the driver and are not charged
+   to the cgroup.
+7. **A wedged box may still answer SSH's banner but never log you in.** Arm
+   a guard before every first boot. [`hostguard.py`](deploy/gb10-glm53/hostguard.py)
+   is a resident process that reads `/proc/meminfo` and kills the container
+   through the docker socket without forking. A guard that shells out per
+   check (like `memguard.sh`) cannot fork once the box thrashes, and it slept
+   through two wedges.
+8. **A checkpoint on a USB SSD: raise read-ahead.** At the default
+   `read_ahead_kb` (1024 on our enclosure) a drive with ~20 ms per request
+   read 99 MiB/s during a boot. At 16384 it read ~470 MiB/s, and a boot fell
+   from ~45 to ~17 min (`/sys/block/<dev>/queue/read_ahead_kb`, persisted
+   with a udev rule).
 
 ## Roadmap
 
+- GLM-5.3-Flash: a static FP4 pool (a served model that is a fixed
+  function), a hybrid KDA state (fp32 working state, fp16 checkpoints -
+  smaller KV block, two long streams with DFlash2), GPTQ for the down
+  projection, and an FP8 reference measurement on larger hardware.
+- DeepSeek-V4-Flash-0731: a 0731-trained DFlash speculator (see its guide).
 - More big-MoE models on single-GB10.
-- A 0731-trained DFlash speculator (see above).
 
 ## Repository layout
 
 - `patch/vllm-moet-v0.24.0.patch` - the whole engine as a patch onto the
   official `vllm/vllm-openai:v0.24.0` arm64 image (upstream's distribution
   model, preserved; regenerated with `tools/check_patch_files.py`).
-- `deploy/gb10/` - Dockerfile, the annotated compose file, memory guard,
-  preflight checks, checkpoint downloader.
+- `deploy/gb10/` - DeepSeek-V4-Flash-0731: Dockerfile, the annotated compose
+  file, memory guard, preflight checks, checkpoint downloader.
+- `deploy/gb10-glm53/` - GLM-5.3-Flash: image build scripts, the serving
+  compose file, `boot.sh`, `hostguard.py`, the checkpoint downloader, and
+  `patches/` (mounted and baked-in vLLM patches, with `build_mounts.sh`).
 - `kernels/cubins-sm120/` - upstream's hand-written SASS kernels (run
   bit-identically on sm_121).
-- `CHANGELOG.md`, `docs/CHANGES-VS-UPSTREAM.md` - per-release history and the
-  full delta against upstream, with the measurements behind each item.
-- `docs/UPSTREAM-README.md` - the original upstream README (worth reading:
-  the architecture and the quality methodology are described there).
+- `tools/` - `apply_w2_overlay.py` (installs the engine on a non-0.24 vLLM
+  tree), `build_fp4_sections.py` (offline FP4 sections), KV-geometry and
+  prefix-cache probes; `tools/glm53/` - the GLM measurement tools (KLD
+  harness, HumanEval, loop and quality probes, benchmark) and the GPTQ
+  builder.
+- `docs/models/` - per-model guides. `docs/GLM-5.3-FLASH.md` - the
+  GLM-5.3-Flash bring-up log. `docs/CHANGES-VS-UPSTREAM.md`,
+  `docs/quality.md`, `docs/UPSTREAM-README.md` (the original upstream README,
+  worth reading for the architecture and the quality methodology).
+- `CHANGELOG.md` - per-release history with the measurements behind each item.
 
 ## License
 
-Apache-2.0, same as upstream. See `LICENSE` and `NOTICE`.
+Apache-2.0, same as upstream. See `LICENSE` and `NOTICE`. Model weights are
+not included. Components the build scripts download keep their own terms:
+the GLM-5.3-Flash NoPE overlay and DFlash2 glue carry no license (downloaded
+at build time, never redistributed here), and the DFlash2 drafter weights are
+CC-BY-NC-ND-4.0.

@@ -1,4 +1,10 @@
-# GLM-5.3-Flash on a single GB10 — feasibility, budget, and the port
+# GLM-5.3-Flash on a single GB10 - feasibility, budget, and the port (bring-up log)
+
+> **This is the bring-up log (2026-08-27 ... 08-29), kept as a record of how
+> the port was reasoned out. The numbers below are historical.** The current
+> guide - configuration, measurements, quality and step-by-step setup - is
+> [`docs/models/glm-5.3-flash.md`](models/glm-5.3-flash.md). The reproduction
+> recipe at the end of this file is superseded by it.
 
 **Status (2026-08-29): SERVING.** GLM-5.3-Flash answers on a single GX10.
 

@@ -2,18 +2,69 @@
 
 Releases are git tags. Each names the serving-image tags
 (`vllm-moet-gb10:vNNN`) built along the way, since that is what the compose
-file pulls.
+file pulls. GLM-5.3-Flash images are built locally by the scripts in
+`deploy/gb10-glm53/` (`vllm-moet-glm53:combined`, `vllm-moet-glm53:dflash2`).
 
 Numbers are measured on the reference box: ASUS Ascent GX10 (GB10, 48 SM,
-121.6 GiB unified, aarch64), DeepSeek-V4-Flash-0731, DSpark k=2, decode over
-500-token runs.
+121.6 GiB unified, aarch64). DeepSeek-V4-Flash-0731 entries: DSpark k=2,
+decode over 500-token runs. GLM-5.3-Flash entries: DFlash2 k=7,
+`reasoning_effort` low, `tools/glm53/bench_mtp.py` (600-token runs,
+temperature 0, mean of three code prompts).
 
 The what-and-why of each change against upstream is in
 [`docs/CHANGES-VS-UPSTREAM.md`](docs/CHANGES-VS-UPSTREAM.md).
 
-## Unreleased
+## v0.3.0 - 2026-09-12
+
+**GLM-5.3-Flash on a single GB10.** A 321B-parameter model whose FP8
+checkpoint is 2.5x the machine's memory serves at ~29 tok/s on code with a
+200K context and HumanEval pass@1 97.0%. Images `vllm-moet-glm53:combined`
+and `vllm-moet-glm53:dflash2` (built locally). Guide, measurements and
+setup: [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md).
 
 ### Added
+
+- **GLM-5.3-Flash serving configuration** (`deploy/gb10-glm53/`): 2-bit
+  routed experts (W2 planes) + a 2 GiB runtime FP4 pool + DFlash2 k=7 +
+  CUDA graphs on the V2 model runner, 200K context. Measured: code
+  **29.4 tok/s** (acceptance length 5.5), prose 12.4-13.5, prefill ~640
+  tok/s (a 198K-token prompt in 313 s, zero preemptions), HumanEval pass@1
+  **97.0%** at `reasoning_effort` low, 0/16 degenerate samples on a
+  long-code loop probe. Model load 99.6 GiB, KV 6.2-7.5 GiB.
+
+- **GPTQ planes calibrated on code** (`tools/glm53/gptq_build.py`, capture
+  hook `deploy/gb10-glm53/patches/patch_xdump.py`). Same 2-bit format, same
+  scales, same kernels - only the choice of code per weight changes, made
+  with one Hessian per layer from the real MoE inputs of a live server
+  (64 x 4096 tokens of source code in many languages). w13 output error on
+  held-out tokens -22.0% on average over 42 layers. Against the RTN planes,
+  on an evaluation corpus disjoint from the calibration: perplexity code
+  -0.7%, EN -1.3%, PL -3.2%; HumanEval 95.7 -> 97.0%; decode unchanged
+  (29.4 tok/s); loop probe 0/16 (RTN 0/16). The calibration is the lever:
+  the same method calibrated on Markdown docs and Polish Wikipedia improved
+  Polish (-3.7%) and cost HumanEval 3.6 points.
+
+- **KLD harness and quality tools** (`tools/glm53/`). `kld_glm.py` measures
+  KL divergence, top-1 agreement and perplexity between two configurations
+  by teacher forcing through prompt logprobs (compose knob `MAX_LOGPROBS`,
+  default 20 = unchanged). First finding: with the dynamic FP4 pool the
+  served model is not a fixed function - two dumps of the same text in one
+  boot differ by KLD 0.010-0.019 (0.006-0.010 without the pool), the noise
+  floor every quality comparison has to clear. Also `quality_pl.py`,
+  `loop_probe.py` + `loop_inspect.py` (the prose repetition metric flags code
+  structure, not loops: 6/16 false alarms on healthy code), `reasoning_probe.py`,
+  `bench_mtp.py` and a HumanEval harness.
+
+- **Reproducible GLM deployment.** `deploy/gb10-glm53/boot.sh` (the
+  production configuration as defaults, API key only from the environment,
+  `DRY_RUN=1`), `patches/build_mounts.sh` (builds the mounted files from the
+  image) and `drop_page_cache.py`; the compose file's volume paths are now
+  variables. Verified on the reference box: `build_mounts.sh` output is
+  byte-identical to the production mounts, and the dry run reproduces the
+  running production container's environment, command and mounts.
+  The builds are pinned to what was measured: the vendor base by digest
+  (the tag `glm53-flash-arm64-cu130` was re-pushed with a different image on
+  2026-09-09) and the two downloaded overlays by commit.
 
 - **DFlash2 speculative decoding for GLM-5.3-Flash on one GB10**
   (`deploy/gb10-glm53/build_dflash2.sh` -> image `vllm-moet-glm53:dflash2`).
@@ -51,7 +102,8 @@ The what-and-why of each change against upstream is in
     the MTP image (`:combined`).
 
 - **GLM-5.3-Flash bring-up** (321B / 18B active, multimodal, hybrid KDA +
-  NoPE sparse MLA). Not yet booted - no serving numbers here until it is.
+  NoPE sparse MLA), first boot 2026-08-29. The pieces that made it fit and
+  serve (the bring-up log is `docs/GLM-5.3-FLASH.md`):
   - `tools/apply_w2_overlay.py`: installs the 2-bit expert engine onto a vLLM
     tree that is not v0.24.0, by extracting the `moe_w2_*` modules **from the
     generated patch** (so the patch stays the single source of truth) and
@@ -102,6 +154,13 @@ The what-and-why of each change against upstream is in
 
 ### Changed
 
+- **GLM-5.3-Flash: FP4 pool 2 GiB instead of 3.** At 200K the KV requirement
+  is 5.12 GiB, and with a 3 GiB pool the available KV varied 4.49-5.83 GiB
+  between boots of the same configuration - production failed to boot one
+  morning. 2 GiB gives 6.2-7.5 GiB. Pool sizes between 2 and 5 GiB showed no
+  measurable quality difference; 0 GiB costs 3.6 points of HumanEval.
+- README restructured for several models; the DeepSeek-V4-Flash-0731 guide
+  moved to `docs/models/deepseek-v4-flash-0731.md`.
 - **Gate operating point settled: tau=0.60 / promote=64 stays the default.** Both
   endpoints of the 2026-08-05 sweep ran the full quality suite. No significant
   difference on HumanEval (93.9 vs 92.1, flips 4/1, McNemar p=0.375), HumanEval+
@@ -126,6 +185,28 @@ The what-and-why of each change against upstream is in
   understates the published checkpoint by roughly 4x; the conclusion is
   unchanged (it does not transfer to `-0731`; base target: 41.6% / 78.8% /
   3.9), but the starting point for a fine-tune is better than recorded.
+
+### Measured and rejected (GLM-5.3-Flash)
+
+- No FP4 pool (`DELTA_GB=0`): +26% decode (32.8 tok/s) and +34% KV, but
+  HumanEval 92.1% (-3.6 points, 6 new failures). The pool protects code.
+- KDA recurrent state in fp16 (`VLLM_KDA_SSM_DTYPE`, patch 7): smaller KV
+  block and +35% KV, but the error grows with the number of roundings -
+  KLD x2 and perplexity +0.4-0.5% in decode-like chunking. bf16 breaks code.
+- Drafter KV in fp8 (patches 9/9b): correct, but FlashInfer's fp8 workspace
+  eats the saving (83 vs 81 KV blocks).
+- Pinning the engine to the Cortex-X925 cores: within noise (the decode step
+  is GPU-bound).
+
+### Known limitations (GLM-5.3-Flash)
+
+- DFlash2 k=7 with `mamba_cache_mode=align` pins 32 KV pool blocks per
+  request: one long stream (200K) fits, two long streams serialise. For
+  concurrent long sessions use the MTP image (`boot.sh DFLASH=0`).
+- The KDA state forces a 7168-token attention block, so an agent pays a
+  roughly constant ~16 s prefill per turn however little it adds.
+- The drafter `incoai/GLM-5.3-Flash-DFlash2` is CC-BY-NC-ND-4.0
+  (non-commercial).
 
 ## v0.2.1 - 2026-08-08
 

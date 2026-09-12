@@ -15,7 +15,7 @@ docker run --rm --network host -e VLLM_API_KEY -v "$PWD":/w -w /w \
 | script | what it answers |
 |---|---|
 | `bench_mtp.py` | Decode tok/s and per-position draft acceptance (any speculative method). The "code" figure is the mean of three code prompts at temperature 0. |
-| `humaneval/` | HumanEval pass@1: `generate.py` on the server, `execute.py` in a network-less container, `report.py`. The dataset is downloaded, not vendored (see `generate.py`). |
+| `humaneval/` | HumanEval pass@1: `generate.py` on the server, `execute.py` in a network-less container, `report.py`. The dataset is downloaded, not vendored (see `generate.py`). `plus_rewrite.py` re-scores the same answers with the much stricter HumanEval+ (EvalPlus) tests. `zai_generate.py` produces the same answers from the ORIGINAL model on the z.ai API (key read from a file), so the local server and the original are scored by one harness. |
 | `kld_glm.py` | Deterministic quality: KL divergence, top-1 agreement and perplexity of one configuration against another, on a fixed corpus, by teacher forcing through prompt logprobs. Needs `MAX_LOGPROBS=64` on the server. |
 | `quality_pl.py` | Generation probe for the two failure modes of bare 2-bit: loops and invented words (detected through the tokenizer), on Polish prose with English and code as controls. |
 | `loop_probe.py` | Long-code loop probe (8 tasks x N samples, fixed seeds), for comparing plane variants. |

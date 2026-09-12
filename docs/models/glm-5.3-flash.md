@@ -22,7 +22,7 @@ release v0.3.0:
 | decode, prose | 12.4-13.5 tok/s |
 | prefill | ~640 tok/s (643 on a 70K prompt, 632 on a 198K prompt) |
 | context | **200K** (204,800); a 198K-token prompt: 313 s to the first token, zero preemptions |
-| HumanEval pass@1 | **97.0%** (159/164) at `reasoning_effort` low |
+| HumanEval pass@1 | **97.0%** (159/164) at `reasoning_effort` low; HumanEval+ **93.9%**. The original model on the z.ai API, same harness: 95.1% / 89.6% |
 | loop probe, long code | 0 of 16 samples degenerate |
 | memory | model 99.6 GiB, KV cache 6.2-7.5 GiB |
 | boot | first-time setup ~2 h (one-time quantization and builds), then 11-19 min per boot depending on the disk |
@@ -193,18 +193,37 @@ decoding changes how fast the model's own output arrives, not what it is.
 - a long-code loop probe with a detector that tells real loops from code
   structure.
 
-For scale: 97.0% equals the HumanEval result
-[reported](https://huggingface.co/sayyidfareed/GLM-5.3-Flash-Spark-Q2XL-MTP) for
-a ~2.56-bit GGUF build of this model on one Spark, here at 2.0 bits per
-expert weight and with vLLM's serving stack (prefix cache, batching, tool
-and reasoning parsers).
+**7. Against the original.** The same HumanEval harness was run against
+the original model on the z.ai API
+([`tools/glm53/humaneval/zai_generate.py`](../../tools/glm53/humaneval/zai_generate.py)).
+Everything was the same: prompts, code extraction, `reasoning_effort` low,
+temperature 0. Both sets of answers were scored with the same sandboxed
+tests, and again with the much stricter HumanEval+ (EvalPlus) tests:
 
-**What we cannot claim.** The FP8 original does not fit on this box, so there
-is no measurement against it here. Every comparison above is against our own
-previous configuration, and perplexity gives the direction. An FP8 reference
-run on larger hardware is the missing anchor. Also, with a dynamic pool the
-served model is not a fixed function: the same text evaluated twice in one
-boot differs by KLD 0.010-0.019 (0.006-0.010 without the pool).
+| | HumanEval | HumanEval+ |
+|---|---:|---:|
+| original, z.ai API | 95.1% (156/164) | 89.6% (147/164) |
+| this setup (GPTQ-code planes) | **97.0%** (159/164) | **93.9%** (154/164) |
+
+On HumanEval+ the original failed 10 tasks we passed, and we failed 3 that
+it passed. An exact McNemar test gives p = 0.09 (HumanEval: p = 0.45). The
+honest reading is **no measurable loss against the original on coding
+tasks**, not that a 2-bit model beats it. How z.ai serves the model
+(precision, templates) is not published.
+
+For scale: sayyidfareed
+[reports](https://huggingface.co/sayyidfareed/GLM-5.3-Flash-Spark-Q2XL-MTP)
+97.0% HumanEval and 93.3% on HumanEval+ Mini (a smaller subset of the plus
+tests) for a ~2.8-bit GGUF build on one Spark, with a 32K context. Here it
+is 2.0 bits per expert weight, a 200K context and vLLM's serving stack
+(prefix cache, batching, tool and reasoning parsers).
+
+**What we cannot claim.** The z.ai API returns no logprobs, so there is no
+KLD against the original - only task results. Every KLD and perplexity
+figure above is against our own previous configuration. Also, with a
+dynamic pool the served model is not a fixed function: the same text
+evaluated twice in one boot differs by KLD 0.010-0.019 (0.006-0.010 without
+the pool).
 
 ## Measurements
 
@@ -246,6 +265,14 @@ HumanEval pass@1 (164 tasks, temperature 0, ~+-2 tasks of noise):
 | RTN planes, no pool | 92.1% | +26% decode |
 | GPTQ planes, calibrated on docs + Polish Wikipedia | 92.1% | Polish perplexity -3.7% |
 | **GPTQ planes, calibrated on code (production)** | **97.0%** | |
+
+Against the original model (z.ai API, same harness). HumanEval+ is the
+EvalPlus v0.1.10 test set, 120 s per task, with time-outs re-run at 600 s:
+
+| | HumanEval | HumanEval+ |
+|---|---:|---:|
+| original, z.ai API | 95.1% | 89.6% |
+| **GPTQ-code planes (production)** | **97.0%** | **93.9%** |
 
 KLD harness, production (GPTQ-code) against the RTN planes. The noise floor
 is the same RTN configuration evaluated twice.

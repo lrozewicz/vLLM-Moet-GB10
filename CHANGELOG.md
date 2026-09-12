@@ -55,6 +55,16 @@ setup: [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md).
   structure, not loops: 6/16 false alarms on healthy code), `reasoning_probe.py`,
   `bench_mtp.py` and a HumanEval harness.
 
+- **Measured against the original model**
+  (`tools/glm53/humaneval/zai_generate.py`, `plus_rewrite.py`). The same
+  HumanEval harness was run against GLM-5.3-Flash on the z.ai API and
+  re-scored with the much stricter HumanEval+ (EvalPlus) tests.
+  - Original: 95.1% / 89.6%.
+  - This setup: 97.0% / 93.9%.
+  - Exact McNemar test: p = 0.45 / 0.09, so no measurable loss on coding
+    tasks.
+  - The API returns no logprobs, so there is no KLD against the original.
+
 - **Reproducible GLM deployment.** `deploy/gb10-glm53/boot.sh` (the
   production configuration as defaults, API key only from the environment,
   `DRY_RUN=1`), `patches/build_mounts.sh` (builds the mounted files from the

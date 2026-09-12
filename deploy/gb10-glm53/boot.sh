@@ -87,23 +87,31 @@ else
 fi
 
 # Patched vLLM files, mounted read-only over the image (patches/README.md).
-if [ "${MOUNT_PATCHES:-1}" = 1 ]; then
-  CUBIT=moe_w2_cubit.py
-  if [ "${XDUMP:-0}" = 1 ]; then
-    CUBIT=moe_w2_cubit.xdump.py
-    export XDUMP_LAYERS="${XDUMP_LAYERS:-$(seq -s, 0 41)}"      # layer keys 0-41 = layers 3-44
-    export XDUMP_DIR="${XDUMP_DIR:-/packs-nvme/xdump}"          # container path; ARM file gates it
-  fi
-  for f in "$CUBIT" moe_w2_delta.py llm_base_proposer.py v2_model_runner.py cuda_platform.py mamba_utils.py; do
-    [ -f "$PATCH_DIR/$f" ] || die "missing $PATCH_DIR/$f - run deploy/gb10-glm53/patches/build_mounts.sh"
-  done
-  export SWIGLU_MOUNT="$PATCH_DIR/$CUBIT"
-  export DELTA_MOUNT="$PATCH_DIR/moe_w2_delta.py"
-  export PROPOSER_MOUNT="$PATCH_DIR/llm_base_proposer.py"
-  export V2RUNNER_MOUNT="$PATCH_DIR/v2_model_runner.py"
-  export CUDAPLAT_MOUNT="$PATCH_DIR/cuda_platform.py"
-  export MAMBAUTILS_MOUNT="$PATCH_DIR/mamba_utils.py"
+# MOUNT_PATCHES=0 mounts the image's own files instead (the .orig.py copies
+# build_mounts.sh saved) - never nothing: the compose file's /dev/null
+# default would put an EMPTY module in place of each file.
+if [ "${MOUNT_PATCHES:-1}" = 1 ]; then SUF=.py; else SUF=.orig.py; fi
+CUBIT=moe_w2_cubit$SUF
+if [ "${XDUMP:-0}" = 1 ]; then
+  CUBIT=moe_w2_cubit.xdump.py
+  export XDUMP_LAYERS="${XDUMP_LAYERS:-$(seq -s, 0 41)}"      # layer keys 0-41 = layers 3-44
+  export XDUMP_DIR="${XDUMP_DIR:-/packs-nvme/xdump}"          # container path; ARM file gates it
 fi
+# PATCH_SCHED=0 switches patch 12 (prefill chunks aligned to the KDA state
+# block) off on its own, for an A/B of just that patch. Without it long agent
+# sessions can restore a KDA state from the wrong position (gibberish turns).
+SCHED=scheduler$SUF
+[ "${PATCH_SCHED:-1}" = 1 ] || SCHED=scheduler.orig.py
+for f in "$CUBIT" moe_w2_delta$SUF llm_base_proposer$SUF v2_model_runner$SUF cuda_platform$SUF mamba_utils$SUF "$SCHED"; do
+  [ -f "$PATCH_DIR/$f" ] || die "missing $PATCH_DIR/$f - run deploy/gb10-glm53/patches/build_mounts.sh"
+done
+export SWIGLU_MOUNT="$PATCH_DIR/$CUBIT"
+export DELTA_MOUNT="$PATCH_DIR/moe_w2_delta$SUF"
+export PROPOSER_MOUNT="$PATCH_DIR/llm_base_proposer$SUF"
+export V2RUNNER_MOUNT="$PATCH_DIR/v2_model_runner$SUF"
+export CUDAPLAT_MOUNT="$PATCH_DIR/cuda_platform$SUF"
+export MAMBAUTILS_MOUNT="$PATCH_DIR/mamba_utils$SUF"
+export SCHED_MOUNT="$PATCH_DIR/$SCHED"
 
 # The DFlash2 drafter's sliding-window layers have no fp8_ds_mla backend on
 # sm_121, so their KV must be skipped from quantization. The flag cannot live

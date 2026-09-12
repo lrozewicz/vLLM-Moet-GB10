@@ -109,6 +109,28 @@ GPTQ planes, below.
 The complete list of patches, with what each one fixes, is in
 [`deploy/gb10-glm53/patches/README.md`](../../deploy/gb10-glm53/patches/README.md).
 
+### 5. Prefix cache and the recurrent state (patch 12)
+
+The prefix cache stores the KDA state only at block boundaries (every 7168
+tokens), and a cached block must hold the state after exactly that many
+tokens. vLLM guarantees it by ending prefill chunks on those boundaries,
+using `cache_config.block_size` as the block. With the DFlash2 drafter that
+value is lowered to 1024, the drafter's block and the smallest block of any
+group in the prefix cache. A chunk could then cross a 7168 boundary. The
+block kept the state of an earlier chunk end but was cached under the
+boundary's hash, so a later turn restoring it lost up to 1024 tokens of
+recurrent state. Usually that went unnoticed; occasionally the turn was
+gibberish from its first token, with draft acceptance at 0%.
+
+It showed up in a long agent session: one bad turn in ~36. We reproduced it
+deterministically by replaying the captured session turn by turn
+([`tools/glm53/pcache_replay.py`](../../tools/glm53/pcache_replay.py)). The
+same turn failed on every run and was clean without prefix-cache hits.
+Patch 12 aligns the chunks to the KDA block, and with it the replay is
+clean, including that turn. We also tried removing the KDA groups from
+vLLM's EAGLE prefix-cache handling (the idea of the unmerged vllm#47861); it
+did not help.
+
 ## Why the quality holds
 
 Short version: per token, only a small part of the computation runs through
@@ -527,6 +549,7 @@ anything.
 | `MEM_MIN` | 105.0 | GiB of `MemFree` required before starting |
 | `GUARD_GIB` | 1.5 | hostguard kills the container below this much available memory |
 | `MOUNT_PATCHES` | 1 | 0 = run the image's original files (A/B) |
+| `PATCH_SCHED` | 1 | 0 = without patch 12 only (reproduces the prefix-cache bug; A/B) |
 | `DROP_DOCKER_LAYERS` | 1 | also drop the page cache of the docker image layers |
 
 `USE_V2`, `GATE`, `BF12` and `CG_EST` are there for experiments; their

@@ -23,9 +23,10 @@ IMAGE="${IMAGE:-vllm-moet-glm53:dflash2}"
 V=/usr/local/lib/python3.12/dist-packages/vllm
 
 # name in OUT -> path inside the vLLM package
-NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils"
+NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils scheduler"
 src_of() {
   case "$1" in
+    scheduler)         echo v1/core/sched/scheduler.py ;;
     moe_w2_cubit)      echo model_executor/layers/quantization/utils/moe_w2_cubit.py ;;
     moe_w2_delta)      echo model_executor/layers/quantization/utils/moe_w2_delta.py ;;
     llm_base_proposer) echo v1/spec_decode/llm_base_proposer.py ;;
@@ -68,6 +69,8 @@ cp "$OUT/cuda_platform.orig.py" "$OUT/cuda_platform.py"
 apply patch_pdl_off.py          "$OUT/cuda_platform.py"
 cp "$OUT/mamba_utils.orig.py" "$OUT/mamba_utils.py"
 apply patch_kda_ssm_dtype.py    "$OUT/mamba_utils.py"
+cp "$OUT/scheduler.orig.py" "$OUT/scheduler.py"
+apply patch_mamba_align_block.py "$OUT/scheduler.py"
 # Optional variant for GPTQ calibration (boot.sh XDUMP=1): production file +
 # the MoE-input dump hook. Never mounted unless asked for.
 cp "$OUT/moe_w2_cubit.py" "$OUT/moe_w2_cubit.xdump.py"

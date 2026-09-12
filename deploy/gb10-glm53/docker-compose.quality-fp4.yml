@@ -99,6 +99,11 @@ services:
       - ${CUDAPLAT_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/platforms/cuda.py:ro
       # LATKA 7: dtype stanu rekurencyjnego KDA (patches/patch_kda_ssm_dtype.py)
       - ${MAMBAUTILS_MOUNT:-/dev/null}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/mamba_utils.py:ro
+      # PATCH 12: prefill chunks aligned to the KDA state block, not to the
+      # drafter-lowered cache_config.block_size (patches/patch_mamba_align_block.py).
+      # No /dev/null default on purpose: an unset variable fails the start
+      # instead of mounting an empty module.
+      - ${SCHED_MOUNT:?SCHED_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py:ro
       # Drafter DFlash2 (incoai/GLM-5.3-Flash-DFlash2, 2.2 GB, CC-BY-NC-ND):
       # DRAFT_DIR=~/glm53-run/dflash2-draft SPEC_METHOD=dflash MTP_K=7
       # SPEC_EXTRA=',"model":"/models/dflash2-draft"' IMAGE=vllm-moet-glm53:dflash2

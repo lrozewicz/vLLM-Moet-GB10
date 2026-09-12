@@ -21,6 +21,7 @@ docker run --rm --network host -e VLLM_API_KEY -v "$PWD":/w -w /w \
 | `loop_probe.py` | Long-code loop probe (8 tasks x N samples, fixed seeds), for comparing plane variants. |
 | `loop_inspect.py` | Tells a real loop (the same line/block repeated in a row, repeated 20-grams) from code structure, which fools the prose repetition metric. |
 | `reasoning_probe.py` | Splits the token budget between `reasoning` and `content` for one task. |
+| `pcache_replay.py` | Replays a captured agent request (messages + tools + sampling, as the client sent it) turn by turn, so every step restores state from the prefix cache the previous steps wrote; a step that looks corrupted is re-run without cache hits (`cache_salt`). This is how the prefix-cache bug fixed by patch 12 was reproduced. |
 | `build_code_calib.py` | Builds the code calibration corpus for GPTQ from local clones of open-source repositories. |
 | `gptq_build.py` | Builds GPTQ planes (w13) from the MoE-input dumps of `patches/patch_xdump.py`. |
 

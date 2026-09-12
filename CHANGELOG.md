@@ -130,6 +130,27 @@ setup: [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md).
 
 ### Fixed
 
+- **GLM-5.3-Flash: rare gibberish turns in long agent sessions** (patch 12,
+  `deploy/gb10-glm53/patches/patch_mamba_align_block.py`).
+  - Mechanism: the prefix cache stores the KDA state at 7168-token block
+    boundaries, and vLLM keeps those checkpoints exact by ending prefill
+    chunks on boundaries of `cache_config.block_size`. EngineCore lowers
+    that value to the smallest prefix-caching group block, here the DFlash2
+    drafter's 1024. A chunk could cross a state boundary, and the checkpoint
+    was cached under the boundary's hash while holding the state of an
+    earlier chunk end.
+  - Symptom: reported as one turn in ~36 of an agent session producing
+    gibberish from its first token (draft acceptance 0%).
+  - Evidence: replaying the captured session turn by turn reproduced it
+    deterministically (the same turn failed on every run, clean without
+    cache hits), and the replay is clean with the patch - 47/47 turns,
+    identical cache hits.
+  - Tool: `tools/glm53/pcache_replay.py`.
+  - Keeping the KDA groups out of vLLM's EAGLE prefix-cache flags (the
+    approach of the unmerged vllm#47861) was measured and did not help.
+  - Also in `boot.sh`: `MOUNT_PATCHES=0` now mounts the image's original
+    files instead of the compose file's empty `/dev/null` default.
+
 - **Tool calls emitted inside a `<think>` span were dropped** ([#1](https://github.com/lrozewicz/vLLM-Moet-GB10/issues/1)).
   0731 opens a thinking block spontaneously even with `enable_thinking: false`
   - v0.2.0 stopped the raw `</think>` tags from leaking, but not this: the

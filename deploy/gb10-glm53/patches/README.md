@@ -34,6 +34,7 @@ the problems were found); several scripts carry their working notes in Polish.
 | 4 | `patch_mtp_token.py` | `v1/spec_decode/llm_base_proposer.py` | MTP mode | Upstream typo: the code reads `config.image_token_index`, `Glm5NextConfig` has `image_token_id`. Blocks the MTP head on this model. Harmless with DFlash2. |
 | 6 | `patch_pdl_off.py` | `platforms/cuda.py` | switch, off | `VLLM_DISABLE_PDL=1` turns off Programmatic Dependent Launch, which vLLM enables for every major >= 9 including the unvalidated sm_121. Default unchanged; kept as an A/B switch. |
 | 7 | `patch_kda_ssm_dtype.py` | `model_executor/layers/mamba/mamba_utils.py` | switch, off | `VLLM_KDA_SSM_DTYPE` sets the dtype of the KDA recurrent state (default f32, unchanged). Measured: bf16 breaks code, fp16 accumulates error in decode (KLD x2, perplexity +0.4-0.5%). Leave it empty. |
+| 12 | `patch_mamba_align_block.py` | `v1/core/sched/scheduler.py` | **required** | Aligns prefill chunks to the KDA state block (7168 tokens) instead of `cache_config.block_size`. EngineCore lowers the latter to the smallest prefix-caching group block, which with the DFlash2 drafter (patch 8) is 1024, so a chunk could run across a state boundary: the KDA checkpoint was cached under the boundary's hash while holding the state of an earlier chunk end. Restoring it caused rare, deterministic gibberish-from-the-first-token turns in long agent sessions (reproduced by replaying a captured session; clean without prefix-cache hits). `PATCH_SCHED=0` switches it off for an A/B. |
 | 10 | `patch_xdump.py` | `moe_w2_cubit.py` (variant) | GPTQ only | Dumps the MoE inputs of selected layers for the GPTQ Hessians (`tools/glm53/gptq_build.py`). Produces `moe_w2_cubit.xdump.py`, mounted only with `boot.sh XDUMP=1`. Records only while `$XDUMP_DIR/ARM` exists. |
 | 8 | `patch_glm5_draft_small_block.py` | `v1/core/kv_cache_utils.py` | baked, **required** | DFlash2 drafter KV at TP=1: the MLA page is 656 B/token = 16 x 41, so the overlay's exact-fit mode can never apply, and its standalone fallback charges a 7168-token drafter page to every pool block (-58% KV capacity). Gives the drafter a 1024-token block (-16%) and strips the `page_size_padded` stamped by `--kv-cache-dtype-skip-layers`. |
 | 9 | `patch_skip_layers_kv_dtype.py` | `layers/attention/attention.py` | baked, switch | `VLLM_KV_SKIP_LAYERS_DTYPE`: fp8 e4m3 KV for the skipped (drafter) layers. Computes correctly, but FlashInfer's fp8 workspace eats what it saves (83 vs 81 blocks). Default `auto` (bf16). |
@@ -60,5 +61,6 @@ re-validate.
 | `v2_model_runner.py` | `de7d7416` | `b4d3ebbf` |
 | `cuda_platform.py` | `59ccbb45` | `782d8c12` |
 | `mamba_utils.py` | `270d7d1b` | `7ec86aa2` |
+| `scheduler.py` | `3d8e5c39` | `e4aba589` |
 
 (first 8 hex digits of md5)

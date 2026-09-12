@@ -1,4 +1,9 @@
 #!/bin/bash
+# HISTORY (bring-up, 2026-08-29): this is the script that ran the very first
+# boot on the reference box, with the bring-up compose file and memguard.sh.
+# It is kept as a record. For a new install use deploy/gb10-glm53/boot.sh,
+# described in docs/models/glm-5.3-flash.md.
+#
 # Pierwszy boot GLM-5.3-Flash: czeka az checkpoint bedzie kompletny, zwalnia
 # pamiec, uzbraja straznika i startuje serwer.
 #
@@ -18,8 +23,9 @@ DEST="${DEST:-/mnt/adata/ai/models/glm-5.3-flash}"
 LOG="${LOG:-$RUNDIR/first-boot.log}"
 COMPOSE="$REPO/deploy/gb10-glm53/docker-compose.glm-5.3-flash.yml"
 CONTAINER=glm53-moet
-# Wspolny klucz API infry - ten sam, ktorym chodzi DS4 i opencode.
-export VLLM_API_KEY="${VLLM_API_KEY:-change-me}"
+# Klucz API: tylko z otoczenia, nigdy wpisany w plik.
+: "${VLLM_API_KEY:?export VLLM_API_KEY first}"
+export VLLM_API_KEY
 
 exec >> "$LOG" 2>&1
 echo "=== START $(date -Is)"

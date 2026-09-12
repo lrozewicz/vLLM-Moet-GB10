@@ -1,42 +1,64 @@
-# Łatki dla GLM-5.3-Flash na GB10
+# Patches for GLM-5.3-Flash on GB10
 
-Skrypty nakładające łatki na pliki **wewnątrz obrazu** `vllm-moet-glm53:combined`.
-Nie modyfikują obrazu — produkują pliki, które `boot.sh` montuje do kontenera
-(`SWIGLU_PATCH=1`). Dzięki temu da się je włączać i wyłączać dla A/B, a po
-aktualizacji obrazu odtworzyć jednym przebiegiem.
+Two kinds of patches are needed on top of the vendor image, and they are
+applied differently on purpose.
 
-## Jak odtworzyć na czystym boksie
+**Mounted patches** (this directory, applied by `build_mounts.sh`). The
+original file is copied OUT of the image, patched on the host and bind-mounted
+read-only over the original by `boot.sh`. The image itself is never modified,
+so every one of these can be switched off for an A/B (`MOUNT_PATCHES=0`), and
+an image update is one re-run of the script.
 
 ```bash
-cd ~/glm53-run/patch
-CID=$(docker create vllm-moet-glm53:combined)
-D=/usr/local/lib/python3.12/dist-packages/vllm
-docker cp $CID:$D/model_executor/layers/quantization/utils/moe_w2_cubit.py  moe_w2_cubit.orig.py
-docker cp $CID:$D/model_executor/layers/quantization/utils/moe_w2_delta.py  moe_w2_delta.orig.py
-docker cp $CID:$D/v1/spec_decode/llm_base_proposer.py                       llm_base_proposer.orig.py
-docker cp $CID:$D/v1/worker/gpu/model_runner.py                             v2_model_runner.orig.py
-docker rm $CID
-
-cp moe_w2_cubit.orig.py moe_w2_cubit.py
-python3 patch_swiglu.py       moe_w2_cubit.py     # diagnostyka (hipoteza odrzucona)
-python3 patch_partial_fp4.py  moe_w2_cubit.py
-python3 patch_store_skip_read.py moe_w2_cubit.py
-cp moe_w2_delta.orig.py moe_w2_delta.py
-python3 patch_delta_skip.py   moe_w2_delta.py
-cp llm_base_proposer.orig.py llm_base_proposer.py
-python3 patch_mtp_token.py    llm_base_proposer.py
-cp v2_model_runner.orig.py v2_model_runner.py
-python3 patch_v2_runner.py    v2_model_runner.py
-docker cp $CID:$D/platforms/cuda.py                                         cuda_platform.orig.py
-cp cuda_platform.orig.py cuda_platform.py
-python3 patch_pdl_off.py      cuda_platform.py    # przelacznik VLLM_DISABLE_PDL
+./deploy/gb10-glm53/patches/build_mounts.sh            # -> ~/glm53-run/patch
 ```
 
-Każdy skrypt jest idempotentny (sprawdza swój znacznik) i waliduje składnię.
-Kotwice są dosłowne — po aktualizacji vLLM mogą wymagać przesunięcia; skrypt
-wtedy **zawodzi głośno**, zamiast po cichu nie zrobić nic.
+**Baked-in patches** (8, 9, 9b). These are applied at image build time by
+`dflash2.dockerfile` (see `build_dflash2.sh`), because the DFlash2 overlay they
+extend is itself installed at build time.
 
-Kolejność dla `moe_w2_cubit.py` ma znaczenie: `patch_store_skip_read.py`
-kotwiczy się w kodzie, który zostawia po sobie `patch_partial_fp4.py`.
+Every script checks its own marker (running it twice is a no-op), validates
+the syntax of the result, and fails loudly when an anchor has moved rather
+than silently doing nothing. The numbers are historical (the order in which
+the problems were found); several scripts carry their working notes in Polish.
 
-Pełny kontekst: `gx10/docs/GLM-5.3-FLASH-STAN.md`.
+## What each patch fixes
+
+| # | script | target | status | what it fixes |
+|---|---|---|---|---|
+| 1 | `patch_swiglu.py` | `moe_w2_cubit.py` | kept, no-op | Reads the SwiGLU clamp from `moe_config` when the layer does not carry it, and logs it. The hypothesis (the checkpoint's `swiglu_limit` 10.0 was silently lost on the expert path) was **rejected**: the limit is read correctly. Kept so the output matches production byte for byte. |
+| 2 | `patch_partial_fp4.py` | `moe_w2_cubit.py` | **required** | A layer without FP4 sections in the planes cache loads as plain 2-bit instead of forcing a requantization from the checkpoint. That requant, with 40 other layers already resident, dies at 0.4-0.8 GiB free (measured three times) - a deadlock on unified memory. |
+| 5 | `patch_store_skip_read.py` | `moe_w2_cubit.py` | **required** | Does not read the FP4 sections from the planes cache when the NVMe store already holds that layer. The read fed nothing, cost a 3.4 GiB transient buffer per layer and 145 GiB of I/O per boot. Anchors in code left by patch 2, so it must run after it. |
+| 3 | `patch_delta_skip.py` | `moe_w2_delta.py` | **required** | Never promotes a layer that has no rows in the FP4 pack. `DeltaTier` iterated `range(n_layers)` blindly; the missing rows are holes in a sparse file, and reading them ended in `illegal memory access`. |
+| - | `patch_v2_runner.py` | `v1/worker/gpu/model_runner.py` | **required** | The FP4 tier's per-step lifecycle in the **V2** model runner: `wait_manager_idle()` before the forward, `step_end()` after it. vLLM selects V2 for this model and speculative decoding on a hybrid model works only on V2, while upstream's hooks live in V1. Without them the tier accumulates pins until it silently stops promoting. |
+| 4 | `patch_mtp_token.py` | `v1/spec_decode/llm_base_proposer.py` | MTP mode | Upstream typo: the code reads `config.image_token_index`, `Glm5NextConfig` has `image_token_id`. Blocks the MTP head on this model. Harmless with DFlash2. |
+| 6 | `patch_pdl_off.py` | `platforms/cuda.py` | switch, off | `VLLM_DISABLE_PDL=1` turns off Programmatic Dependent Launch, which vLLM enables for every major >= 9 including the unvalidated sm_121. Default unchanged; kept as an A/B switch. |
+| 7 | `patch_kda_ssm_dtype.py` | `model_executor/layers/mamba/mamba_utils.py` | switch, off | `VLLM_KDA_SSM_DTYPE` sets the dtype of the KDA recurrent state (default f32, unchanged). Measured: bf16 breaks code, fp16 accumulates error in decode (KLD x2, perplexity +0.4-0.5%). Leave it empty. |
+| 10 | `patch_xdump.py` | `moe_w2_cubit.py` (variant) | GPTQ only | Dumps the MoE inputs of selected layers for the GPTQ Hessians (`tools/glm53/gptq_build.py`). Produces `moe_w2_cubit.xdump.py`, mounted only with `boot.sh XDUMP=1`. Records only while `$XDUMP_DIR/ARM` exists. |
+| 8 | `patch_glm5_draft_small_block.py` | `v1/core/kv_cache_utils.py` | baked, **required** | DFlash2 drafter KV at TP=1: the MLA page is 656 B/token = 16 x 41, so the overlay's exact-fit mode can never apply, and its standalone fallback charges a 7168-token drafter page to every pool block (-58% KV capacity). Gives the drafter a 1024-token block (-16%) and strips the `page_size_padded` stamped by `--kv-cache-dtype-skip-layers`. |
+| 9 | `patch_skip_layers_kv_dtype.py` | `layers/attention/attention.py` | baked, switch | `VLLM_KV_SKIP_LAYERS_DTYPE`: fp8 e4m3 KV for the skipped (drafter) layers. Computes correctly, but FlashInfer's fp8 workspace eats what it saves (83 vs 81 blocks). Default `auto` (bf16). |
+| 9b | `patch_flashinfer_builder_dtype.py` | `v1/attention/backends/flashinfer.py` | baked | Companion of 9: the FlashInfer builder uses the per-layer KV dtype instead of the global `fp8_ds_mla`. |
+
+Worth reporting upstream: the `image_token_index` typo (4) to vLLM, and the
+missing layer check in the `DeltaTier` promotion loop (3) to vLLM-Moet.
+
+## Reference checksums
+
+On the reference box, `build_mounts.sh` against `vllm-moet-glm53:dflash2`
+(built on the pinned base `vllm/vllm-openai@sha256:905c0293...`, image config
+`d42649063a2b`) produces files byte-identical to the ones the production
+server mounts. If your `.orig.py` checksums differ, the base image changed:
+the patches may still apply (they anchor on code, not on line numbers), but
+re-validate.
+
+| file | `.orig.py` (from the image) | patched |
+|---|---|---|
+| `moe_w2_cubit.py` | `436d0352` | `822cf242` |
+| `moe_w2_cubit.xdump.py` | - | `db09d1e0` |
+| `moe_w2_delta.py` | `ed93b97e` | `77606ddb` |
+| `llm_base_proposer.py` | `17d9b24e` | `20525b32` |
+| `v2_model_runner.py` | `de7d7416` | `b4d3ebbf` |
+| `cuda_platform.py` | `59ccbb45` | `782d8c12` |
+| `mamba_utils.py` | `270d7d1b` | `7ec86aa2` |
+
+(first 8 hex digits of md5)

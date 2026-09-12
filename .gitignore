@@ -19,3 +19,9 @@ patch/*.whl
 bench/results/smoke/
 .build-combined/
 .build-dflash2/
+
+# GLM-5.3 measurement data: the HumanEval dataset is fetched, never vendored;
+# generation/execution outputs and KLD dumps are per-run artifacts
+tools/glm53/humaneval/*.jsonl
+tools/glm53/humaneval/*.json
+tools/glm53/**/*.npz

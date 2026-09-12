@@ -262,7 +262,7 @@ services:
       - "--no-scheduler-reserve-full-isl"
       - "--tensor-parallel-size=1"
       # MTP draft depth. Sweepowalne bez edycji tego pliku: MTP_K=3 docker
-      # compose up -d. ZMIERZONE na tym boksie 2026-08-29 (gx10/tools/
+      # compose up -d. ZMIERZONE na tym boksie 2026-08-29 (tools/glm53/
       # bench_mtp.py, temp 0, powtarzalne co do 0.1 tok/s):
       #
       #   krok decode:  k=2 -> 121.0 ms    k=3 -> 139.1 ms   (+18.1 ms/poziom)
@@ -288,7 +288,7 @@ services:
       #
       # k=4 NIE oplaca sie - zmierzony zanik warunkowej akceptacji to 0.823
       # na poziom, wiec projekcja daje +0.3% na najlepszym promptcie i -2 do
-      # -9% na reszcie (gx10/tools/mtp_predict.py). Karta modelu sugeruje 5,
+      # -9% na reszcie (projekcja z rozkladu akceptacji). Karta modelu sugeruje 5,
       # ale to liczba dla maszyn, gdzie drafter jest tani wzgledem weryfikacji;
       # tutaj glowica MTP to pelna warstwa MoE i kosztuje 15% kroku.
       #

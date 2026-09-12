@@ -23,7 +23,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="${WORK:-$REPO_ROOT/.build-dflash2}"
 TAG="${TAG:-vllm-moet-glm53:dflash2}"
 BASE="${BASE:-vllm-moet-glm53:combined}"
-UP="${UP:-https://raw.githubusercontent.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark/main/overlay-dflash2}"
+# Pinned to the commit our image was built from (identical bytes); override
+# UP to follow the repository's main branch instead.
+UP="${UP:-https://raw.githubusercontent.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark/64c92e982cf71ecd7a05bf25582344a5554ab08a/overlay-dflash2}"
 
 mkdir -p "$WORK/overlay/dflash2"
 echo "== pobieram overlay DFlash2 (sekwencyjnie, jeden strumien; $WORK jest w .gitignore)"

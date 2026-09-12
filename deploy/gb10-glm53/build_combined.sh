@@ -21,8 +21,15 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="${WORK:-$REPO_ROOT/.build-combined}"
 TAG="${TAG:-vllm-moet-glm53:combined}"
-BASE="${BASE:-vllm/vllm-openai:glm53-flash-arm64-cu130}"
-UPSTREAM_URL="${UPSTREAM_URL:-https://raw.githubusercontent.com/chriswritescode-dev/glm-5.3-flash-sm120/main/Dockerfile}"
+# PINNED to what every published number was measured on. BASE is the arm64
+# variant of the multi-arch digest their Dockerfile pins (image config
+# sha256:d42649063a2b..., vLLM 0.1.dev20051+g487ecf187). The tag
+# vllm/vllm-openai:glm53-flash-arm64-cu130 was re-pushed with a DIFFERENT
+# image on 2026-09-09, so a tag here would silently build on an unvalidated
+# base. The overlay is pinned to the commit that was current for our builds
+# (identical bytes to what we used). Override either to try newer versions.
+BASE="${BASE:-vllm/vllm-openai@sha256:905c02933be6021301db2dc284e24e3727467aa3a0f63b41d609885778a07bce}"
+UPSTREAM_URL="${UPSTREAM_URL:-https://raw.githubusercontent.com/chriswritescode-dev/glm-5.3-flash-sm120/dc6b4fdd68005ab6ee0b1decfa4ebb8384393d37/Dockerfile}"
 
 mkdir -p "$WORK"
 echo "== pobieram overlay NoPE (nie trafia do repo: $WORK jest w .gitignore)"

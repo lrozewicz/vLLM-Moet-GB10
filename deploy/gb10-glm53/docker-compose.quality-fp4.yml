@@ -2,11 +2,17 @@
 # MLA) on a SINGLE NVIDIA GB10 box (DGX Spark / ASUS Ascent GX10, 121.6 GiB
 # unified memory).
 #
-# STATUS: bring-up configuration. The memory budget, tensor shapes and kernel
-# coverage below are computed from the published checkpoint and verified
-# against this repo's cubin set; end-to-end serving numbers are NOT measured
-# yet and this file carries none. See docs/GLM-5.3-FLASH.md for what is
-# established fact and what is still open.
+# STATUS: the SERVING configuration (v0.3.0). Start it through
+# deploy/gb10-glm53/boot.sh, not with a bare `docker compose up`: boot.sh sets
+# the production values of every ${KNOB} below, mounts the patched files,
+# drops the page cache and adds the one DFlash2 flag that cannot live here.
+# Guide, measurements and the reasoning behind each knob:
+# docs/models/glm-5.3-flash.md. Measured at serve (DFlash2 k=7, FP4 pool
+# 2 GiB, 200K context): model load 99.6 GiB, KV 6.2-7.5 GiB, ~29 tok/s on code.
+#
+# Many knob comments below are in Polish - they are the working notes of the
+# experiment that set each value, kept verbatim. The budget below is the
+# bring-up arithmetic; the numbers above are measured.
 #
 # ============================ WHY THIS FITS ==================================
 #
@@ -30,8 +36,9 @@
 # with its own 288 experts - 6.75 GiB at FP8. Upstream deliberately leaves the
 # drafter unquantized (its acceptance numbers were measured that way), and
 # `is_w2_layer` honours that by cutting at num_hidden_layers. On this box that
-# choice costs 5 GiB of the remaining headroom, so speculation is staged
-# separately rather than enabled here - see docs/GLM-5.3-FLASH.md#mtp.
+# choice costs 5 GiB of the remaining headroom, so the MTP layer goes to 2-bit
+# too (VLLM_MOE_W2_NUM_LAYERS=46 below). The default drafter is DFlash2
+# (IMAGE=vllm-moet-glm53:dflash2), which does not load layer 45 at all.
 #
 # UNIFIED MEMORY, THE SHORT VERSION (long version in the DS4 compose file):
 #   - host RAM IS VRAM: anything a discrete-GPU design parks in "cheap host
@@ -66,18 +73,20 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # Host paths come from boot.sh (DATA_DIR / MODEL_DIR / CACHE_DIR /
+      # PACKS_DIR / NVME_DIR); the defaults are the reference box layout.
       # Stock FP8 checkpoint (~306 GiB). Downloaded separately; the container
       # starts fully offline (see env below).
-      - /mnt/adata/ai/models/glm-5.3-flash:/model:ro
+      - ${MODEL_DIR:-/mnt/adata/ai/models/glm-5.3-flash}:/model:ro
       # torch.compile / cudagraph caches - persist across restarts.
-      - /mnt/adata/ai/models/glm-5.3-flash-cache:/root/.cache
+      - ${CACHE_DIR:-/mnt/adata/ai/models/glm-5.3-flash-cache}:/root/.cache
       # Persistent planes cache (quantization results). After the first boot
       # every later boot LOADER-SKIPs the checkpoint entirely: no staging, no
       # requant. Sequential I/O - a slower (USB/SATA) disk is fine here.
-      - /mnt/adata/ai/models/glm-5.3-flash-packs:/packs
-      # FP4 delta-tier pack. Random reads at serve time (gate promotions) -
-      # this one belongs on the INTERNAL NVMe.
-      - /var/lib/glm53-packs-nvme:/packs-nvme
+      - ${PACKS_DIR:-/mnt/adata/ai/models/glm-5.3-flash-packs}:/packs
+      # FP4 delta-tier pack (146 GB). Random reads at serve time (pool
+      # promotions) - this one belongs on the INTERNAL NVMe.
+      - ${NVME_DIR:-/var/lib/glm53-packs-nvme}:/packs-nvme
       # LATKA SWIGLU (SWIGLU_PATCH=1): podmienia moe_w2_cubit.py na wersje,
       # ktora czyta swiglu_limit takze z layer.moe_config. Bez niej klamra
       # 10.0 deklarowana przez checkpoint znika po cichu na sciezce ekspertow.
@@ -220,6 +229,16 @@ services:
       # Pelna mapa precyzji (ktory ekspert jest FP4) jako JSON przy kazdym
       # podsumowaniu - zapis atomowy, da sie tailowac.
       - VLLM_MOE_W2_DELTA_DUMP=${DELTA_DUMP:-}
+      # MoE-input dump for offline GPTQ calibration (tools/glm53/gptq_build.py).
+      # Needs the moe_w2_cubit.xdump.py variant (patches/patch_xdump.py,
+      # boot.sh XDUMP=1) and records only while $XDUMP_DIR/ARM exists.
+      # Empty = off.
+      - VLLM_MOE_W2_XDUMP_LAYERS=${XDUMP_LAYERS:-}
+      - VLLM_MOE_W2_XDUMP_DIR=${XDUMP_DIR:-/root/.cache/xdump}
+      - VLLM_MOE_W2_XDUMP_FLUSH=${XDUMP_FLUSH:-32768}
+      # Upstream routing capture: per-tick seen (layer, expert) frames -> .npy.
+      # Empty = off.
+      - VLLM_MOE_W2_DELTA_CAPTURE=${DELTA_CAPTURE:-}
       # Live-tunable gate knobs (mtime-cached, re-read on change): sweep tau /
       # promote budget on a warm server, no restarts. Start at the upstream
       # defaults (0.60 / 64) - they are a deliberate quality-first operating
@@ -343,6 +362,9 @@ services:
       # linearly (measured on DS4: 512 -> ~250 tok/s, 4096 -> 753 tok/s).
       - "--max-num-batched-tokens=${MNBT:-2048}"
       - "--no-scheduler-reserve-full-isl"
+      # Prompt logprobs for the KLD harness (tools/glm53/kld_glm.py asks for
+      # top-64); 20 is vLLM's own default, so production is unchanged.
+      - "--max-logprobs=${MAX_LOGPROBS:-20}"
       - "--tensor-parallel-size=1"
       # DFlash2 WYMAGA dodatkowo `--kv-cache-dtype-skip-layers=sliding_window`
       # (KV draftera w bf16: warstwy SWA nie maja na sm_121 backendu dla
@@ -350,7 +372,7 @@ services:
       # parsuje sie do [""] i wlacza logike padded-spec dla wszystkich - wiec
       # boot.sh (DFLASH=1) dokleja ja do tymczasowej kopii tego pliku.
       # MTP draft depth. Sweepowalne bez edycji tego pliku: MTP_K=3 docker
-      # compose up -d. ZMIERZONE na tym boksie 2026-08-29 (gx10/tools/
+      # compose up -d. ZMIERZONE na tym boksie 2026-08-29 (tools/glm53/
       # bench_mtp.py, temp 0, powtarzalne co do 0.1 tok/s):
       #
       #   krok decode:  k=2 -> 121.0 ms    k=3 -> 139.1 ms   (+18.1 ms/poziom)
@@ -376,7 +398,7 @@ services:
       #
       # k=4 NIE oplaca sie - zmierzony zanik warunkowej akceptacji to 0.823
       # na poziom, wiec projekcja daje +0.3% na najlepszym promptcie i -2 do
-      # -9% na reszcie (gx10/tools/mtp_predict.py). Karta modelu sugeruje 5,
+      # -9% na reszcie (projekcja z rozkladu akceptacji). Karta modelu sugeruje 5,
       # ale to liczba dla maszyn, gdzie drafter jest tani wzgledem weryfikacji;
       # tutaj glowica MTP to pelna warstwa MoE i kosztuje 15% kroku.
       #

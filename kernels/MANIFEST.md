@@ -3,6 +3,11 @@
 Hand‑written SASS assembled by `cubit` (pinned @ `5912400`). Cubins are **SM120‑only**.
 Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sass/qmma_e4m3.merc.stub`.
 
+GLM-5.3-Flash on GB10 serves the decode `moe_w2_mm` / `moe_w4_mm` (K = 4096, 2048)
+from [`cubins-sm120-loop/`](cubins-sm120-loop/README.md) instead: the same kernel
+bodies with a grid-stride loop over compacted pair tables (patch 14). That README
+also covers rebuilding with today's cubit (the `5912400` pin no longer exists).
+
 ## Activation format rev `_a32` (group‑size‑flexible A scales) — the LIVE set
 
 All MoE GEMM cubins the server loads carry the `_a32` filename suffix: the

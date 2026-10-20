@@ -36,6 +36,7 @@ the problems were found); several scripts carry their working notes in Polish.
 | 7 | `patch_kda_ssm_dtype.py` | `model_executor/layers/mamba/mamba_utils.py` | switch, off | `VLLM_KDA_SSM_DTYPE` sets the dtype of the KDA recurrent state (default f32, unchanged). Measured: bf16 breaks code, fp16 accumulates error in decode (KLD x2, perplexity +0.4-0.5%). Leave it empty. |
 | 12 | `patch_mamba_align_block.py` | `v1/core/sched/scheduler.py` | **required** | Aligns prefill chunks to the KDA state block (7168 tokens) instead of `cache_config.block_size`. EngineCore lowers the latter to the smallest prefix-caching group block, which with the DFlash2 drafter (patch 8) is 1024, so a chunk could run across a state boundary: the KDA checkpoint was cached under the boundary's hash while holding the state of an earlier chunk end. Restoring it caused rare, deterministic gibberish-from-the-first-token turns in long agent sessions (reproduced by replaying a captured session; clean without prefix-cache hits). `PATCH_SCHED=0` switches it off for an A/B. |
 | 13 | `patch_w8a16_loader.py` + `glm53_w8a16.py` | `model_executor/model_loader/utils.py` + new module `model_executor/layers/quantization/utils/glm53_w8a16.py` | **on by default** (`W8A16_RE`) | Block-128 FP8 W8A16 for the BF16 linears that dominate a decode step on GB10 (46% of it, nsys): KDA q/k/v/o and lm_head (BF16 in the FP8 release), the MLA q_b/o/fused_qkv_a (FP8 in the checkpoint, dequantized to BF16 on load by the NoPE overlay), and the whole DFlash2 drafter. The loader hook gives every module whose name matches `VLLM_GLM53_W8A16_RE` the W8A16 method before its `process_weights_after_loading`; the module requantizes the weight and keeps ONE plain FP8 copy. Decode runs a Triton W8A16 kernel on it (BF16 activations, as fast as FP8 Marlin, which needs a second repacked copy), prefill (M >= 128) dequantizes it to BF16 (bit-exact) for the stock GEMM. KDA gates, `kv_b_proj`, indexer and router stay BF16. Measured: decode +25-34% on code, +29-33% on prose, weights 99.6 -> 92.8 GiB; quality in [the model doc](../../../docs/models/glm-5.3-flash.md). `W8A16_RE=` switches it off. |
+| 14 | `patch_moe_loop.py` + `kernels/cubins-sm120-loop` | `moe_w2_cubit.py` + the cubin dir (`$PATCH_DIR/cubit` over `/cubit-share`) | **on by default** (`LOOP_GRID`, `FUSE_GLUE`) | The decode MoE launch had `grid.y` = the moe_align table length, and each tier's empty pairs (m_rows = 0) were CTAs that loaded their desc and exited: 4-5 ms per step on GB10. The desc build compacts each tier's live pairs to the front of its table and looped cubins (the shipped kernel bodies, schedule unchanged, plus a grid-stride loop) walk it from a fixed grid (16 / 12). Also fuses the MoE glue: the token quant, row gather, scale copy and the FP4 tier's seen flags in one Triton kernel, the SwiGLU and the second quant in another. Bit-exact with the old path (`tools/glm53/loop_check.py`, `desc_check.py`, `glue_bench.py`); code 39.2 -> 42.2 tok/s. `LOOP_GRID= FUSE_GLUE=0` = the old launch. Runs after patch 5. |
 | 10 | `patch_xdump.py` | `moe_w2_cubit.py` (variant) | GPTQ only | Dumps the MoE inputs of selected layers for the GPTQ Hessians (`tools/glm53/gptq_build.py`). Produces `moe_w2_cubit.xdump.py`, mounted only with `boot.sh XDUMP=1`. Records only while `$XDUMP_DIR/ARM` exists. |
 | 8 | `patch_glm5_draft_small_block.py` | `v1/core/kv_cache_utils.py` | baked, **required** | DFlash2 drafter KV at TP=1: the MLA page is 656 B/token = 16 x 41, so the overlay's exact-fit mode can never apply, and its standalone fallback charges a 7168-token drafter page to every pool block (-58% KV capacity). Gives the drafter a 1024-token block (-16%) and strips the `page_size_padded` stamped by `--kv-cache-dtype-skip-layers`. |
 | 9 | `patch_skip_layers_kv_dtype.py` | `layers/attention/attention.py` | baked, switch | `VLLM_KV_SKIP_LAYERS_DTYPE`: fp8 e4m3 KV for the skipped (drafter) layers. Computes correctly, but FlashInfer's fp8 workspace eats what it saves (83 vs 81 blocks). Default `auto` (bf16). |
@@ -55,8 +56,8 @@ re-validate.
 
 | file | `.orig.py` (from the image) | patched |
 |---|---|---|
-| `moe_w2_cubit.py` | `436d0352` | `822cf242` |
-| `moe_w2_cubit.xdump.py` | - | `db09d1e0` |
+| `moe_w2_cubit.py` | `436d0352` | `265c3cc0` |
+| `moe_w2_cubit.xdump.py` | - | `4b6d3eca` |
 | `moe_w2_delta.py` | `ed93b97e` | `77606ddb` |
 | `llm_base_proposer.py` | `17d9b24e` | `20525b32` |
 | `v2_model_runner.py` | `de7d7416` | `b4d3ebbf` |
@@ -66,4 +67,8 @@ re-validate.
 | `model_loader/utils.py` (`loader_utils.py`) | `dc8831e4` | `ffa1aef2` |
 | `glm53_w8a16.py` (new, copied) | - | `3fcac2a6` |
 
-(first 8 hex digits of md5)
+(first 8 hex digits of md5; before patch 14 the patched `moe_w2_cubit.py` was
+`822cf242` and its xdump variant `db09d1e0`). `$PATCH_DIR/cubit` is the image's
+`/cubit-share` (80 cubins) with the four files of `kernels/cubins-sm120-loop`
+swapped in (checksums in its README); `$PATCH_DIR/cubit.orig` is the
+untouched copy that `MOUNT_PATCHES=0` mounts.

@@ -1,0 +1,94 @@
+diff --git a/src/eiattr.rs b/src/eiattr.rs
+index 954a537..3305ec5 100644
+--- a/src/eiattr.rs
++++ b/src/eiattr.rs
+@@ -1046,7 +1046,7 @@ impl KernelMeta {
+         if self.shared_size > 0 {
+             records.push(EiRecord {
+                 attr: 0x0008, fmt: EiFmt::Sized,
+-                data: (self.shared_size + 0x400).to_le_bytes().to_vec(),
++                data: (self.shared_size + crate::elf_builder::smem_cap() as u32).to_le_bytes().to_vec(),
+             });
+         }
+ 
+diff --git a/src/elf_builder.rs b/src/elf_builder.rs
+index c3c18c9..681654a 100644
+--- a/src/elf_builder.rs
++++ b/src/elf_builder.rs
+@@ -4347,7 +4347,7 @@ impl CubinBuilder {
+                 shared_off,
+                 0,
+                 // b10 F-2: vendor footprint = user_max>0 ? user+cap+r0 : r0(0x40)
+-                if max_shared > 0x40 { max_shared + 0x400 + 0x40 } else { 0x40 },
++                if max_shared > 0x40 { max_shared + smem_cap() + 0x40 } else { 0x40 },
+                 8,
+             );
+             phi += 1;
+@@ -5019,7 +5019,7 @@ impl CubinBuilder {
+                     0,
+                     text_k(ki) as u32,
+                     0,
+-                    Some(sh_size + 0x400),
++                    Some(sh_size + crate::elf_builder::smem_cap()),
+                 ));
+             } else {
+                 // Even if shared_size is 0, we still need the section for index consistency
+@@ -5309,7 +5309,7 @@ impl CubinBuilder {
+         let text_end = text_start + (0..n).map(|ki| sec_size[text_k(ki)]).sum::<u64>();
+ 
+         // b10 F-2: vendor footprint (smem: user+0x400+0x40; else 0x40)
+-        let shared_memsz: u64 = if max_shared > 0x40 { max_shared + 0x400 + 0x40 } else { 0x40 };
++        let shared_memsz: u64 = if max_shared > 0x40 { max_shared + smem_cap() + 0x40 } else { 0x40 };
+         let shared_filesz: u64 = 0;
+ 
+         let const_start = sec_off[const0_k(0)];
+@@ -6107,7 +6107,7 @@ impl CubinBuilder {
+                 0,
+                 text_k(ki) as u32,
+                 0,
+-                Some(sh_size + 0x400),
++                Some(sh_size + crate::elf_builder::smem_cap()),
+             ));
+         }
+ 
+@@ -6371,7 +6371,7 @@ impl CubinBuilder {
+         let text_end = text_start + (0..n).map(|ki| sec_size[text_k(ki)]).sum::<u64>();
+ 
+         // b10 F-2: vendor footprint (smem: user+0x400+0x40; else 0x40)
+-        let shared_memsz: u64 = if max_shared > 0x40 { max_shared + 0x400 + 0x40 } else { 0x40 };
++        let shared_memsz: u64 = if max_shared > 0x40 { max_shared + smem_cap() + 0x40 } else { 0x40 };
+         let shared_filesz: u64 = 0;
+ 
+         let const_start = sec_off[const0_k(0)];
+@@ -7019,3 +7019,9 @@ fn align_to(buf: &mut Vec<u8>, align: usize) {
+         buf.extend(std::iter::repeat_n(0u8, align - r));
+     }
+ }
++
++/// Local knob (gx10): CUBIT_SMEM_CAP=0 drops the sm_103a 1 KiB reserved-smem cap
++/// (the pre-merc13 cubit emitted none for sm_120).
++pub fn smem_cap() -> u64 {
++    if std::env::var("CUBIT_SMEM_CAP").map(|v| v == "0").unwrap_or(false) { 0 } else { 0x400 }
++}
+diff --git a/src/main.rs b/src/main.rs
+index d0ea4e2..80a20e3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -4176,7 +4176,7 @@ fn cmd_asm_build_elf(
+         rebuild_cubin(&ref_bytes, &patches)?
+     } else {
+         use cubit::elf_builder::{build_cubin_for_arch, build_cubin_mercury_for_arch};
+-        if tensor_class_kernels {
++        if tensor_class_kernels && entries.iter().all(|e| e.mercury_stub.is_none()) {
+             eprintln!(
+                 "note: tcgen05/TMA-class instructions present and no explicit \
+                            --mercury-stub — emitting a Mercury-free cubin so the driver \
+@@ -5385,7 +5385,7 @@ fn cmd_asm_directive_format(
+         rebuild_cubin(&ref_bytes, &patches)?
+     } else {
+         use cubit::elf_builder::{build_cubin_for_arch, build_cubin_mercury_for_arch};
+-        if tensor_class_kernels {
++        if tensor_class_kernels && entries.iter().all(|e| e.mercury_stub.is_none()) {
+             eprintln!(
+                 "note: tcgen05/TMA-class instructions present and no explicit \
+                        --mercury-stub — emitting a Mercury-free cubin (driver .text \

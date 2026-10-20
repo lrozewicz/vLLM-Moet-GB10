@@ -83,6 +83,11 @@ export W8A16_RE="${W8A16_RE-$W8A16_DEFAULT}"
 # weights are 99.6 GiB and KV_MEM=8375186227 (7.8 GiB, 111 blocks) is the most
 # that leaves the host its margin. Measured with DFlash2 only (DFLASH=1).
 export KV_MEM="${KV_MEM-13743895347}"
+# Patch 14: decode MoE without the empty pairs (grid-stride cubins over
+# compacted desc tables, grid.y = 16 for w2, 12 for w4) and the fused MoE glue.
+# Bit-exact; code 39.2 -> 42.2 tok/s. LOOP_GRID= FUSE_GLUE=0 = the old launch.
+export LOOP_GRID="${LOOP_GRID-16,12}"
+export FUSE_GLUE="${FUSE_GLUE-1}"
 MEM_MIN="${MEM_MIN:-105.0}"             # GiB of MemFree required before starting
 
 export DFLASH="${DFLASH:-1}"
@@ -128,6 +133,13 @@ export MAMBAUTILS_MOUNT="$PATCH_DIR/mamba_utils$SUF"
 export SCHED_MOUNT="$PATCH_DIR/$SCHED"
 export LOADER_MOUNT="$PATCH_DIR/loader_utils$SUF"
 export W8A16_MOUNT="$PATCH_DIR/glm53_w8a16.py"   # a new module: inert unless the loader hook imports it
+# Patch 14: the cubin dir build_mounts.sh assembled (image cubins + the looped
+# decode moe_w2/w4; bit-exact with the image's, also with LOOP_GRID=).
+# MOUNT_PATCHES=0 mounts the image's own copy: the unpatched launcher passes
+# no loop parameters.
+if [ "${MOUNT_PATCHES:-1}" = 1 ]; then CUBIT_DIR=cubit; else CUBIT_DIR=cubit.orig; fi
+[ -d "$PATCH_DIR/$CUBIT_DIR" ] || die "missing $PATCH_DIR/$CUBIT_DIR - run deploy/gb10-glm53/patches/build_mounts.sh"
+export CUBIT_MOUNT="$PATCH_DIR/$CUBIT_DIR"
 
 # The DFlash2 drafter's sliding-window layers have no fp8_ds_mla backend on
 # sm_121, so their KV must be skipped from quantization. The flag cannot live

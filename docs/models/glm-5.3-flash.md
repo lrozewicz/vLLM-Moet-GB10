@@ -14,12 +14,13 @@ step by step.
 ## At a glance
 
 Measured on the reference box (ASUS Ascent GX10, GB10, 121.6 GiB, aarch64),
-release v0.3.0 plus patch 13 (FP8 W8A16, 2026-10-20):
+release v0.3.0 plus patches 13 (FP8 W8A16, 2026-10-20) and 14 (MoE launch without
+empty pairs, 2026-10-21):
 
 | | |
 |---|---|
-| decode, code | **~39 tok/s** (38.9; v0.3.0 without patch 13: 29-31) - DFlash2 k=7, acceptance length 5.6, temperature 0, `reasoning_effort` low |
-| decode, prose | 17.1 tok/s (v0.3.0: 12.4-13.5) |
+| decode, code | **~42 tok/s** (41.5-42.2 over three boots; patch 13 alone 38.9-39.2, v0.3.0 29-31) - DFlash2 k=7, acceptance length 5.5-5.6, temperature 0, `reasoning_effort` low |
+| decode, prose | 17.6-18.5 tok/s (patch 13 alone 17.1-17.3, v0.3.0 12.4-13.5) |
 | two streams | 25.4 tok/s each, 46.6 together (code edits); two 96K prompts at once without preemption |
 | prefill | ~640 tok/s (643 on a 70K prompt, 632 on a 198K prompt) |
 | context | **200K** (204,800); a 198K-token prompt: 313 s to the first token, zero preemptions |
@@ -163,6 +164,34 @@ community runs of this model found BF16 gates, indexer and activations help
 long-context recall (local-inference-lab vllm#1027), and they are small.
 `W8A16_RE=` switches the patch off.
 
+### 7. Speed again: the empty pairs of the MoE launch (patch 14)
+
+The expert GEMMs (the hand-written `moe_w2_mm` / `moe_w4_mm`) already run at
+GB10's bandwidth ceiling (210-224 GB/s measured, ~230 for a plain read), so
+the kernel body has nothing left to give. The launch around it did: a decode
+forward launches each tier with `grid.y` = the moe_align table length (64 at
+T = 8), and only that tier's live pairs do work; the others are CTAs that
+load their descriptor and exit - ~0.5 us (w2) / ~0.8 us (w4) per empty pair
+per launch, 4-5 ms per step. Patch 14 compacts each tier's live pairs to the
+front of its table and launches a small fixed grid (16 / 12) of looped
+kernels that walk the table (`kernels/cubins-sm120-loop`; the kernel body is
+the shipped one instruction for instruction, see its README). It also fuses
+the MoE glue around them: the token quant, row gather, scale copy and the FP4
+tier's seen flags in one Triton kernel, the SwiGLU and the second quant in
+another. Everything is bit-exact with the old path (GPU checks in
+`tools/glm53/`); measured the same night against a fresh patch-13 boot:
+
+| | patch 13 | + loop | + loop + glue fusion |
+|---|---:|---:|---:|
+| decode step, code / prose (ms) | 140.6 / 137.6 | 132.6-133.2 / 131.2-132.3 | **131.5 / 130.5** |
+| decode, code (bench, tok/s) | 39.2 | 41.5-42.0 | **42.2** |
+| prose, 6 long Polish texts (tok/s) | 14.2 | 15.0-15.2 | **15.8** |
+| HumanEval / HumanEval+, of 164 | 154 / 146 | 154 / 144, 149 / 141 | 156 / 147 |
+
+HumanEval moves with the boot, not with the patch (the kernels compute the
+same bits; the FP4 pool's fill order changes the greedy text from boot to
+boot, ~+-3 tasks). `LOOP_GRID= FUSE_GLUE=0` switches it off.
+
 ## Why the quality holds
 
 Short version: per token, only a small part of the computation runs through
@@ -273,15 +302,17 @@ code prompts, 600 tokens, temperature 0, `reasoning_effort` low, warm server,
 | V2 runner port: FP4 3 GiB + MTP k=4 + CUDA graphs | 18.2 | 10 of 10 samples clean |
 | + promotion hysteresis 1.25, 200K context | 19.6 | |
 | DFlash2 k=7 instead of the MTP head | 29.3 | HumanEval 95.7% |
-| **GPTQ planes (code calibration), pool 2 GiB** | **29.4** | **HumanEval 97.0%** |
+| GPTQ planes (code calibration), pool 2 GiB | 29.4 | HumanEval 97.0% |
+| FP8 W8A16 for the BF16 linears (patch 13) | 38.9 | HumanEval / HE+ in noise, KLD 0.02-0.03 |
+| **MoE launch without empty pairs + glue fusion (patch 14)** | **42.2** | **bit-exact** |
 
 ### Speed and context (current configuration)
 
 | | |
 |---|---|
-| decode, code | 29.4 tok/s, acceptance length 5.5 (first draft position accepted 93-96%, the seventh ~40%) |
-| decode, code, `reasoning_effort` high | 24.6 tok/s (thinking is harder to draft) |
-| decode, prose | 12.4-13.5 tok/s |
+| decode, code | ~42 tok/s, acceptance length 5.5 (first draft position accepted 92-94%, the seventh ~40%) |
+| decode, code, `reasoning_effort` high | 24.6 tok/s at v0.3.0, not re-measured since (thinking is harder to draft) |
+| decode, prose | 17.6-18.5 tok/s (bench prompt); 15.0-15.8 on six long Polish texts |
 | prefill | 643 tok/s at 70K, 632 tok/s at 198K (flat) |
 | one 198K-token prompt | TTFT 313 s, 86% of the KV pool, 0 preemptions |
 | two concurrent streams | two short ones (up to ~28K) fine; two long ones serialise |

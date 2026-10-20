@@ -109,6 +109,10 @@ services:
       # imports (patches/glm53_w8a16.py). Same no-default rule as patch 12.
       - ${LOADER_MOUNT:?LOADER_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/utils.py:ro
       - ${W8A16_MOUNT:?W8A16_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/glm53_w8a16.py:ro
+      # PATCH 14: the image's cubins with the decode moe_w2_mm / moe_w4_mm
+      # replaced by the grid-stride (looped) builds from
+      # kernels/cubins-sm120-loop (patches/patch_moe_loop.py launches them).
+      - ${CUBIT_MOUNT:?CUBIT_MOUNT is set by deploy/gb10-glm53/boot.sh}:/cubit-share:ro
       # Drafter DFlash2 (incoai/GLM-5.3-Flash-DFlash2, 2.2 GB, CC-BY-NC-ND):
       # DRAFT_DIR=~/glm53-run/dflash2-draft SPEC_METHOD=dflash MTP_K=7
       # SPEC_EXTRA=',"model":"/models/dflash2-draft"' IMAGE=vllm-moet-glm53:dflash2
@@ -219,6 +223,11 @@ services:
       # FP8 W8A16 after load (empty = all stay BF16), and the batch size from
       # which they are dequantized to BF16 instead (prefill). Set by boot.sh.
       - VLLM_GLM53_W8A16_RE=${W8A16_RE:-}
+      # PATCH 14: decode MoE grid.y for w2,w4 over compacted desc tables
+      # (empty = one CTA row per table entry, as before) and the fused MoE
+      # glue (gather+quant+seen, SwiGLU+quant). Both bit-exact.
+      - VLLM_MOE_W2_LOOP_GRID=${LOOP_GRID:-}
+      - VLLM_MOE_W2_FUSE_GLUE=${FUSE_GLUE:-0}
       - VLLM_GLM53_W8A16_PREFILL_M=${W8A16_PREFILL_M:-128}
       # Blok KV draftera DFlash2 w trybie standalone (LATKA 8, tylko obraz
       # dflash2). Pusty = automat (najwiekszy dzielnik bloku MLA <= 1024,

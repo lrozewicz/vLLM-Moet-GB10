@@ -44,8 +44,18 @@ trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 for n in $NAMES; do
   docker cp -q "$CID:$V/$(src_of "$n")" "$OUT/$n.orig.py"
 done
+# Patch 14: the image's cubin dir with the decode moe_w2_mm / moe_w4_mm
+# swapped for the looped builds (kernels/cubins-sm120-loop).
+rm -rf "$OUT/cubit" "$OUT/cubit.orig"
+docker cp -q "$CID:/cubit-share" "$OUT/cubit.orig"
+cp -a "$OUT/cubit.orig" "$OUT/cubit"
 docker rm "$CID" >/dev/null
 trap - EXIT
+LOOP_DIR="$HERE/../../../kernels/cubins-sm120-loop"
+for f in "$LOOP_DIR"/*.cubin; do
+  cp "$f" "$OUT/cubit/"
+done
+echo "== cubit: $(ls "$OUT/cubit" | wc -l) cubins, looped: $(cd "$LOOP_DIR" && ls *.cubin | tr '\n' ' ')"
 
 apply() {  # apply <patch script> <target>
   echo "-- $1 -> $(basename "$2")"
@@ -60,6 +70,7 @@ cp "$OUT/moe_w2_cubit.orig.py" "$OUT/moe_w2_cubit.py"
 apply patch_swiglu.py           "$OUT/moe_w2_cubit.py"
 apply patch_partial_fp4.py      "$OUT/moe_w2_cubit.py"
 apply patch_store_skip_read.py  "$OUT/moe_w2_cubit.py"
+apply patch_moe_loop.py         "$OUT/moe_w2_cubit.py"
 cp "$OUT/moe_w2_delta.orig.py" "$OUT/moe_w2_delta.py"
 apply patch_delta_skip.py       "$OUT/moe_w2_delta.py"
 cp "$OUT/llm_base_proposer.orig.py" "$OUT/llm_base_proposer.py"

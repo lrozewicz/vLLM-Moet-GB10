@@ -25,6 +25,11 @@ docker run --rm --network host -e VLLM_API_KEY -v "$PWD":/w -w /w \
 | `needle.py` | Long-context retrieval: 8 "access code" notes spread over real source code at even depths (`--hard`: 24 notes, 12 first names x 2 surnames, 8 asked), ~105K and ~190K tokens; reports hits per depth. |
 | `conc_bench.py` | One vs two concurrent streams on a code-edit task (per-stream and aggregate tok/s, draft acceptance), and whether two long prompts (`--cap-sizes`) decode together without preemption. |
 | `w8a16_bench.py` | Tunes the Triton W8A16 kernel of patch 13 (`deploy/gb10-glm53/patches/glm53_w8a16.py`) per weight shape against BF16 and FP8 Marlin; run in the serving image with the server stopped. |
+| `loop_check.py` | Patch 14 kernels: the looped `moe_w2_mm`/`moe_w4_mm` (`kernels/cubins-sm120-loop`) against the shipped ones - bit-exact output for every shape, live pair count and grid, and the launch time with and without compaction. Server stopped, serving image, `NEW_DIR=<cubin dir>`. |
+| `variant_time.py` | Same-work timing (one pair per CTA, scattered live pairs) and bit comparison of any number of cubin directories, e.g. a rebuild against the shipped set. Imports `loop_check.py`. |
+| `desc_check.py` | Patch 14 desc build: the COMPACT tables hold exactly the live entries of the scattered ones, in order, with an empty tail. Takes the patched `moe_w2_cubit.py`. |
+| `glue_bench.py` | Patch 14 glue fusion: the fused gather+quant+seen and SwiGLU+quant kernels against the production ops (bit-exact) and their time. Takes the patched `moe_w2_cubit.py`. |
+| `step_sum.py` | Step time (decode seconds per draft), acceptance and tok/s per category from `bench_mtp.py` JSONs - the robust way to compare configurations, since acceptance moves +-3% between boots of the same one (the FP4 pool changes the greedy text). |
 | `build_code_calib.py` | Builds the code calibration corpus for GPTQ from local clones of open-source repositories. |
 | `gptq_build.py` | Builds GPTQ planes (w13) from the MoE-input dumps of `patches/patch_xdump.py`. |
 

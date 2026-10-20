@@ -14,13 +14,13 @@ step by step.
 ## At a glance
 
 Measured on the reference box (ASUS Ascent GX10, GB10, 121.6 GiB, aarch64),
-release v0.3.0 plus patches 13 (FP8 W8A16, 2026-10-20) and 14 (MoE launch without
-empty pairs, 2026-10-21):
+release v0.3.0 plus patches 13 (FP8 W8A16, 2026-10-20), 14 (MoE launch without
+empty pairs) and 15 (adaptive draft depth, both 2026-10-21):
 
 | | |
 |---|---|
 | decode, code | **~42 tok/s** (41.5-42.2 over three boots; patch 13 alone 38.9-39.2, v0.3.0 29-31) - DFlash2 k=7, acceptance length 5.5-5.6, temperature 0, `reasoning_effort` low |
-| decode, prose | 17.6-18.5 tok/s (patch 13 alone 17.1-17.3, v0.3.0 12.4-13.5) |
+| decode, prose | **21.3 tok/s** (bench prompt; fixed k=7: 17.6-18.6, v0.3.0 12.4-13.5); 18.2 on six long Polish texts (k=7: 15.0-15.8) |
 | two streams | 25.4 tok/s each, 46.6 together (code edits); two 96K prompts at once without preemption |
 | prefill | ~640 tok/s (643 on a 70K prompt, 632 on a 198K prompt) |
 | context | **200K** (204,800); a 198K-token prompt: 313 s to the first token, zero preemptions |
@@ -192,6 +192,36 @@ HumanEval moves with the boot, not with the patch (the kernels compute the
 same bits; the FP4 pool's fill order changes the greedy text from boot to
 boot, ~+-3 tasks). `LOOP_GRID= FUSE_GLUE=0` switches it off.
 
+### 8. The draft depth per step (patch 15)
+
+DFlash2 drafts 7 tokens and the target verifies all 8 positions, but on this
+box a decode step is not flat in the number of verified tokens: more tokens
+mean more distinct experts to stream. Measured with fixed k (same night):
+
+| k | step, ms | code tok/s (acceptance) | prose tok/s (acceptance) |
+|---:|---:|---:|---:|
+| 3 | 103.1 | 34.5 (3.56) | **21.4** (2.19) |
+| 5 | 117.3 | 40.4 (4.74) | 18.7 (2.18) |
+| 7 | 132.8 | **42.7** (5.66) | 18.6 (2.44) |
+
+so T(k) ~ 81 + 7.4 k ms: code wants k = 7 (acceptance keeps growing to the last
+position), prose wants k = 3. Patch 15 picks per step: the scheduler keeps a
+per-request EMA of the conditional acceptance p and takes the k in {3, 7} that
+maximizes E[tokens](k) / T(k) (a cost-driven controller, ported from our MiMo
+deployment). Verification still decides every token, so the output is the
+model's own; only how many drafted tokens get checked changes.
+
+| | fixed k = 7 | adaptive {3, 7} |
+|---|---:|---:|
+| code, bench (tok/s) | 41.5-42.7 | 41.6 |
+| prose, bench (tok/s) | 18.5-18.6 | **21.3** |
+| prose, 6 long Polish texts (tok/s) | 15.0-15.8 | **18.2** |
+| HumanEval / HumanEval+, of 164 | 154-156 / 144-147 | 156 / 146 |
+
+{3, 5, 7} with a faster EMA (decay 0.8) cost 3% on code: the estimate is
+noisy, and around code's acceptance k = 5 and 7 are within 5% of each other,
+so it kept stepping down. `ADAPTIVE=0` = fixed k.
+
 ## Why the quality holds
 
 Short version: per token, only a small part of the computation runs through
@@ -304,7 +334,8 @@ code prompts, 600 tokens, temperature 0, `reasoning_effort` low, warm server,
 | DFlash2 k=7 instead of the MTP head | 29.3 | HumanEval 95.7% |
 | GPTQ planes (code calibration), pool 2 GiB | 29.4 | HumanEval 97.0% |
 | FP8 W8A16 for the BF16 linears (patch 13) | 38.9 | HumanEval / HE+ in noise, KLD 0.02-0.03 |
-| **MoE launch without empty pairs + glue fusion (patch 14)** | **42.2** | **bit-exact** |
+| MoE launch without empty pairs + glue fusion (patch 14) | 42.2 | bit-exact |
+| **adaptive draft depth (patch 15)** | **41.6 (prose 21.3)** | **lossless (verification)** |
 
 ### Speed and context (current configuration)
 

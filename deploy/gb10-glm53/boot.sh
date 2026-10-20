@@ -96,6 +96,16 @@ if [ "$DFLASH" = 1 ]; then
   export IMAGE="${IMAGE:-vllm-moet-glm53:dflash2}"
   export SPEC_METHOD=dflash MTP_K="${MTP_K:-7}"
   export SPEC_EXTRA=',"model":"/models/dflash2-draft"'
+  # Patch 15: the draft depth per step from live acceptance, k in {3, 7}
+  # (ADAPTIVE_KS) - code keeps 7, prose drops to 3: the step costs ~81 + 7.4k ms
+  # here, so on prose (acceptance ~2.2) a 4-token verify wins. Measured: prose
+  # 18.6 -> 21.3 tok/s, code within boot-to-boot noise. ADAPTIVE=0 = fixed k.
+  # It rides on vLLM's dynamic speculative decoding path; the table only keeps
+  # MTP_K as the maximum.
+  export ADAPTIVE="${ADAPTIVE-1}"
+  if [ "$ADAPTIVE" = 1 ]; then
+    SPEC_EXTRA="$SPEC_EXTRA"',"num_speculative_tokens_per_batch_size":[[1,2,'"$MTP_K"']]'
+  fi
   export DRAFT_DIR="${DRAFT_DIR:-$RUN_DIR/dflash2-draft}"      # incoai/GLM-5.3-Flash-DFlash2
   [ -f "$DRAFT_DIR/model.safetensors" ] || die "no drafter in $DRAFT_DIR (see the doc: hf download incoai/GLM-5.3-Flash-DFlash2)"
 else
@@ -140,6 +150,8 @@ export W8A16_MOUNT="$PATCH_DIR/glm53_w8a16.py"   # a new module: inert unless th
 if [ "${MOUNT_PATCHES:-1}" = 1 ]; then CUBIT_DIR=cubit; else CUBIT_DIR=cubit.orig; fi
 [ -d "$PATCH_DIR/$CUBIT_DIR" ] || die "missing $PATCH_DIR/$CUBIT_DIR - run deploy/gb10-glm53/patches/build_mounts.sh"
 export CUBIT_MOUNT="$PATCH_DIR/$CUBIT_DIR"
+export CGUTILS_MOUNT="$PATCH_DIR/cudagraph_utils$SUF"
+[ -f "$CGUTILS_MOUNT" ] || die "missing $CGUTILS_MOUNT - run deploy/gb10-glm53/patches/build_mounts.sh"
 
 # The DFlash2 drafter's sliding-window layers have no fp8_ds_mla backend on
 # sm_121, so their KV must be skipped from quantization. The flag cannot live

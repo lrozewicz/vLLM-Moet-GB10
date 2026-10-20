@@ -109,6 +109,9 @@ services:
       # imports (patches/glm53_w8a16.py). Same no-default rule as patch 12.
       - ${LOADER_MOUNT:?LOADER_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/utils.py:ro
       - ${W8A16_MOUNT:?W8A16_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/glm53_w8a16.py:ro
+      # PATCH 15: adaptive draft depth - the controller is in the scheduler
+      # (SCHED_MOUNT), this adds the decode graphs for every k it may pick.
+      - ${CGUTILS_MOUNT:?CGUTILS_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/cudagraph_utils.py:ro
       # PATCH 14: the image's cubins with the decode moe_w2_mm / moe_w4_mm
       # replaced by the grid-stride (looped) builds from
       # kernels/cubins-sm120-loop (patches/patch_moe_loop.py launches them).
@@ -228,6 +231,13 @@ services:
       # glue (gather+quant+seen, SwiGLU+quant). Both bit-exact.
       - VLLM_MOE_W2_LOOP_GRID=${LOOP_GRID:-}
       - VLLM_MOE_W2_FUSE_GLUE=${FUSE_GLUE:-0}
+      # PATCH 15: draft depth per step from live acceptance (patches/patch_adaptive_k.py):
+      # k in ADAPTIVE_KS maximizing E[tokens](k) / (T0 + c*k), T0,c in ms from step times.
+      - VLLM_SPEC_ADAPTIVE=${ADAPTIVE:-0}
+      - VLLM_SPEC_ADAPTIVE_KS=${ADAPTIVE_KS:-3,7}
+      - VLLM_SPEC_ADAPTIVE_COST=${ADAPTIVE_COST:-81,7.4}
+      - VLLM_SPEC_ADAPTIVE_BATCH=${ADAPTIVE_BATCH:-1}
+      - VLLM_SPEC_ADAPTIVE_DECAY=${ADAPTIVE_DECAY:-0.9}
       - VLLM_GLM53_W8A16_PREFILL_M=${W8A16_PREFILL_M:-128}
       # Blok KV draftera DFlash2 w trybie standalone (LATKA 8, tylko obraz
       # dflash2). Pusty = automat (najwiekszy dzielnik bloku MLA <= 1024,

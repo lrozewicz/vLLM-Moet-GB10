@@ -23,7 +23,7 @@ IMAGE="${IMAGE:-vllm-moet-glm53:dflash2}"
 V=/usr/local/lib/python3.12/dist-packages/vllm
 
 # name in OUT -> path inside the vLLM package
-NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils scheduler loader_utils"
+NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils scheduler loader_utils cudagraph_utils"
 src_of() {
   case "$1" in
     scheduler)         echo v1/core/sched/scheduler.py ;;
@@ -34,6 +34,7 @@ src_of() {
     cuda_platform)     echo platforms/cuda.py ;;
     mamba_utils)       echo model_executor/layers/mamba/mamba_utils.py ;;
     loader_utils)      echo model_executor/model_loader/utils.py ;;
+    cudagraph_utils)   echo v1/worker/gpu/cudagraph_utils.py ;;
   esac
 }
 
@@ -83,6 +84,9 @@ cp "$OUT/mamba_utils.orig.py" "$OUT/mamba_utils.py"
 apply patch_kda_ssm_dtype.py    "$OUT/mamba_utils.py"
 cp "$OUT/scheduler.orig.py" "$OUT/scheduler.py"
 apply patch_mamba_align_block.py "$OUT/scheduler.py"
+apply patch_adaptive_k.py       "$OUT/scheduler.py"
+cp "$OUT/cudagraph_utils.orig.py" "$OUT/cudagraph_utils.py"
+apply patch_adaptive_graphs.py  "$OUT/cudagraph_utils.py"
 cp "$OUT/loader_utils.orig.py" "$OUT/loader_utils.py"
 apply patch_w8a16_loader.py     "$OUT/loader_utils.py"
 # Not a patch but a new module (patch 13 imports it): copied as is.

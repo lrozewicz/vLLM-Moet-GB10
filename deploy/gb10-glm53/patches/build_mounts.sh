@@ -23,7 +23,7 @@ IMAGE="${IMAGE:-vllm-moet-glm53:dflash2}"
 V=/usr/local/lib/python3.12/dist-packages/vllm
 
 # name in OUT -> path inside the vLLM package
-NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils scheduler"
+NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils scheduler loader_utils"
 src_of() {
   case "$1" in
     scheduler)         echo v1/core/sched/scheduler.py ;;
@@ -33,6 +33,7 @@ src_of() {
     v2_model_runner)   echo v1/worker/gpu/model_runner.py ;;
     cuda_platform)     echo platforms/cuda.py ;;
     mamba_utils)       echo model_executor/layers/mamba/mamba_utils.py ;;
+    loader_utils)      echo model_executor/model_loader/utils.py ;;
   esac
 }
 
@@ -71,13 +72,18 @@ cp "$OUT/mamba_utils.orig.py" "$OUT/mamba_utils.py"
 apply patch_kda_ssm_dtype.py    "$OUT/mamba_utils.py"
 cp "$OUT/scheduler.orig.py" "$OUT/scheduler.py"
 apply patch_mamba_align_block.py "$OUT/scheduler.py"
+cp "$OUT/loader_utils.orig.py" "$OUT/loader_utils.py"
+apply patch_w8a16_loader.py     "$OUT/loader_utils.py"
+# Not a patch but a new module (patch 13 imports it): copied as is.
+cp "$HERE/glm53_w8a16.py" "$OUT/glm53_w8a16.py"
+python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$OUT/glm53_w8a16.py"
 # Optional variant for GPTQ calibration (boot.sh XDUMP=1): production file +
 # the MoE-input dump hook. Never mounted unless asked for.
 cp "$OUT/moe_w2_cubit.py" "$OUT/moe_w2_cubit.xdump.py"
 apply patch_xdump.py            "$OUT/moe_w2_cubit.xdump.py"
 
 echo "== result (md5, compare with patches/README.md)"
-for n in $NAMES moe_w2_cubit.xdump; do
+for n in $NAMES moe_w2_cubit.xdump glm53_w8a16; do
   f="$OUT/$n.py"
   [ "$n" = moe_w2_cubit.xdump ] && f="$OUT/moe_w2_cubit.xdump.py"
   printf '  %-24s %s\n' "$(basename "$f")" "$(md5sum < "$f" | cut -c1-8)"

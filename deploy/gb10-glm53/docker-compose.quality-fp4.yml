@@ -104,6 +104,11 @@ services:
       # No /dev/null default on purpose: an unset variable fails the start
       # instead of mounting an empty module.
       - ${SCHED_MOUNT:?SCHED_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py:ro
+      # PATCH 13: FP8 W8A16 for the BF16 linears selected by W8A16_RE - a hook
+      # in the loader (patches/patch_w8a16_loader.py) plus the new module it
+      # imports (patches/glm53_w8a16.py). Same no-default rule as patch 12.
+      - ${LOADER_MOUNT:?LOADER_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/utils.py:ro
+      - ${W8A16_MOUNT:?W8A16_MOUNT is set by deploy/gb10-glm53/boot.sh}:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/glm53_w8a16.py:ro
       # Drafter DFlash2 (incoai/GLM-5.3-Flash-DFlash2, 2.2 GB, CC-BY-NC-ND):
       # DRAFT_DIR=~/glm53-run/dflash2-draft SPEC_METHOD=dflash MTP_K=7
       # SPEC_EXTRA=',"model":"/models/dflash2-draft"' IMAGE=vllm-moet-glm53:dflash2
@@ -210,6 +215,11 @@ services:
       # rozmiar strony mamby, a przez nia strone attention (dzis 6912 tok.),
       # czyli staly podatek prefix-cache na ture agenta.
       - VLLM_KDA_SSM_DTYPE=${KDA_SSM:-}
+      # PATCH 13: module-name regex of the BF16 linears that become block-128
+      # FP8 W8A16 after load (empty = all stay BF16), and the batch size from
+      # which they are dequantized to BF16 instead (prefill). Set by boot.sh.
+      - VLLM_GLM53_W8A16_RE=${W8A16_RE:-}
+      - VLLM_GLM53_W8A16_PREFILL_M=${W8A16_PREFILL_M:-128}
       # Blok KV draftera DFlash2 w trybie standalone (LATKA 8, tylko obraz
       # dflash2). Pusty = automat (najwiekszy dzielnik bloku MLA <= 1024,
       # wielokrotnosc 64 -> 1024 przy bloku 7168); 0 = blok modelu.

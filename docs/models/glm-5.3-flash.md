@@ -14,17 +14,18 @@ step by step.
 ## At a glance
 
 Measured on the reference box (ASUS Ascent GX10, GB10, 121.6 GiB, aarch64),
-release v0.3.0:
+release v0.3.0 plus patch 13 (FP8 W8A16, 2026-10-20):
 
 | | |
 |---|---|
-| decode, code | **~29 tok/s** (29.4; 26-29 across boots) - DFlash2 k=7, acceptance length 5.5, temperature 0, `reasoning_effort` low |
-| decode, prose | 12.4-13.5 tok/s |
+| decode, code | **~39 tok/s** (38.9; v0.3.0 without patch 13: 29-31) - DFlash2 k=7, acceptance length 5.6, temperature 0, `reasoning_effort` low |
+| decode, prose | 17.1 tok/s (v0.3.0: 12.4-13.5) |
+| two streams | 25.4 tok/s each, 46.6 together (code edits); two 96K prompts at once without preemption |
 | prefill | ~640 tok/s (643 on a 70K prompt, 632 on a 198K prompt) |
 | context | **200K** (204,800); a 198K-token prompt: 313 s to the first token, zero preemptions |
 | HumanEval pass@1 | **97.0%** (159/164) at `reasoning_effort` low; HumanEval+ **93.9%**. The original model on the z.ai API, same harness: 95.1% / 89.6% |
 | loop probe, long code | 0 of 16 samples degenerate |
-| memory | model 99.6 GiB, KV cache 6.2-7.5 GiB |
+| memory | model 92.7 GiB, KV cache 12.8 GiB fixed (182 blocks, ~510K tokens) |
 | boot | first-time setup ~2 h (one-time quantization and builds), then 11-19 min per boot depending on the disk |
 
 ## What it took
@@ -130,6 +131,37 @@ Patch 12 aligns the chunks to the KDA block, and with it the replay is
 clean, including that turn. We also tried removing the KDA groups from
 vLLM's EAGLE prefix-cache handling (the idea of the unmerged vllm#47861); it
 did not help.
+
+### 6. Speed again: the BF16 linears in FP8 (patch 13)
+
+An nsys profile of one decode step (k=7, one stream) showed it bandwidth
+bound everywhere, and 46% of it in BF16 GEMMs: the FP8 release keeps the
+q/k/v/o of the 34 KDA layers (9.1 GB) and the lm_head in BF16, the NoPE
+overlay dequantizes the MLA q_b/o projections to BF16 on load, and the
+DFlash2 drafter is BF16 throughout. Patch 13 requantizes all of them after
+load to block-128 FP8 (the checkpoint's own format) and keeps one plain copy.
+Decode runs a Triton W8A16 kernel on it - BF16 activations, FP32
+accumulation, as fast as FP8 Marlin, which would need a second, repacked
+copy - and prefill dequantizes it to BF16 for the stock GEMM.
+
+| | v0.3.0 | + patch 13 |
+|---|---:|---:|
+| decode, code / prose | 29-31 / 12.8-13.2 tok/s | **38.9 / 17.1** |
+| model in memory | 99.6 GiB | **92.7 GiB** |
+| KV cache | 7.8 GiB (111 blocks) | **12.8 GiB (182 blocks)** |
+| HumanEval / HumanEval+, of 164 (mean of 5 runs / 3 runs) | 155.8 / 147.0 | 154.7 / 146.0 |
+| KLD vs all-BF16 linears (code / en / pl) | - | 0.021 / 0.028 / 0.021 |
+| needles in ~105K / ~190K of code (8 per prompt, 6 prompts) | 48/48 | 48/48 |
+| hard needles, ~190K (24 near-duplicate names, 8 asked, 3 prompts) | 16/24 | 17/24 |
+| prefill, ~190K-token prompt | 282-284 s | 289-298 s |
+
+The KLD is 2-4x the harness's noise floor (0.005-0.009 for this comparison,
+without the FP4 pool), perplexity moves by under 1% and in Polish goes down;
+HumanEval differs by less than its boot-to-boot spread (~3 tasks). The KDA
+gates (b, f_a, g_a), `kv_b_proj`, the DSA indexer and the router stay BF16:
+community runs of this model found BF16 gates, indexer and activations help
+long-context recall (local-inference-lab vllm#1027), and they are small.
+`W8A16_RE=` switches the patch off.
 
 ## Why the quality holds
 
@@ -517,7 +549,7 @@ exists (`PLANES_DIR=planes-cache-fp4` goes back to RTN):
 ### 9. Check what you got
 
 ```bash
-python3 tools/glm53/bench_mtp.py --repeats 2 --warmup      # ~29 tok/s on the code prompts
+python3 tools/glm53/bench_mtp.py --repeats 2 --warmup      # ~39 tok/s on the code prompts (~29 with W8A16_RE=)
 ```
 
 HumanEval (~40 min): see [`tools/glm53/humaneval/`](../../tools/glm53/humaneval/)
@@ -572,6 +604,8 @@ anything.
 | `MNBT` | 2048 | prefill chunk (`--max-num-batched-tokens`) |
 | `MM_IMG` / `MM_VID` | 0 / 0 | images / videos per prompt |
 | `MAX_LOGPROBS` | 20 | 64 for the KLD harness |
+| `W8A16_RE` | KDA q/k/v/o, lm_head, MLA, drafter | module-name regex of the BF16 linears patch 13 runs in FP8; empty = all BF16 |
+| `KV_MEM` | 13743895347 (12.8 GiB) | fixed KV pool (`--kv-cache-memory`); empty = vLLM's profiling (75-126 blocks at random on GB10). With `W8A16_RE=` use 8375186227 |
 | `XDUMP` | 0 | 1 = mount the GPTQ capture hook |
 | `MEM_MIN` | 105.0 | GiB of `MemFree` required before starting |
 | `GUARD_GIB` | 1.5 | hostguard kills the container below this much available memory |
@@ -610,10 +644,9 @@ file's comments.
   time - but we have not measured it.
 - No FP8 reference measurement (see above), and the dynamic pool makes the
   served model slightly non-deterministic.
-- The available KV varies between boots of the same configuration (4.5-5.8
-  GiB with a 3 GiB pool) - hence the 2 GiB pool for 200K.
-- One long stream at a time with DFlash2, and the ~16 s prefill tax per
-  agent turn.
+- vLLM's start-up profiling gives a different KV pool on every boot on
+  GB10 (it counts page cache as used memory); `KV_MEM` fixes it.
+- The ~16 s prefill tax per agent turn.
 - Open: a static FP4 pool (deterministic serving), a hybrid KDA state (fp32
   working state, fp16 checkpoints: smaller block, cheaper agent turns, two
   long streams with DFlash2), GPTQ for the down projection, damping and

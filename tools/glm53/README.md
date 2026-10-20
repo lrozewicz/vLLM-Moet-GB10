@@ -22,6 +22,9 @@ docker run --rm --network host -e VLLM_API_KEY -v "$PWD":/w -w /w \
 | `loop_inspect.py` | Tells a real loop (the same line/block repeated in a row, repeated 20-grams) from code structure, which fools the prose repetition metric. |
 | `reasoning_probe.py` | Splits the token budget between `reasoning` and `content` for one task. |
 | `pcache_replay.py` | Replays a captured agent request (messages + tools + sampling, as the client sent it) turn by turn, so every step restores state from the prefix cache the previous steps wrote; a step that looks corrupted is re-run without cache hits (`cache_salt`). This is how the prefix-cache bug fixed by patch 12 was reproduced. |
+| `needle.py` | Long-context retrieval: 8 "access code" notes spread over real source code at even depths (`--hard`: 24 notes, 12 first names x 2 surnames, 8 asked), ~105K and ~190K tokens; reports hits per depth. |
+| `conc_bench.py` | One vs two concurrent streams on a code-edit task (per-stream and aggregate tok/s, draft acceptance), and whether two long prompts (`--cap-sizes`) decode together without preemption. |
+| `w8a16_bench.py` | Tunes the Triton W8A16 kernel of patch 13 (`deploy/gb10-glm53/patches/glm53_w8a16.py`) per weight shape against BF16 and FP8 Marlin; run in the serving image with the server stopped. |
 | `build_code_calib.py` | Builds the code calibration corpus for GPTQ from local clones of open-source repositories. |
 | `gptq_build.py` | Builds GPTQ planes (w13) from the MoE-input dumps of `patches/patch_xdump.py`. |
 

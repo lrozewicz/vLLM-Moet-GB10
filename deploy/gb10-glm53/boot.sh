@@ -11,6 +11,7 @@
 #   DELTA_GB=0 boot.sh 120        # the very first boot (builds the planes cache)
 #   DFLASH=0 boot.sh              # MTP k=4 instead of DFlash2 (two long streams)
 #   XDUMP=1 boot.sh               # arm the GPTQ calibration hook (see the doc)
+#   W8A16_RE= KV_MEM=8375186227 boot.sh   # all-BF16 linears, as before patch 13
 #   DRY_RUN=1 boot.sh             # print the resolved compose file and exit
 #
 # What it does, in order. Each step is here because skipping it cost us a
@@ -69,6 +70,19 @@ export UTIL="${UTIL:-0.94}"             # gpu-memory-utilization
 export MNBT="${MNBT:-2048}"             # max-num-batched-tokens (prefill chunk)
 export CG_EST="${CG_EST:-0}"            # do not reserve ~4.9 GiB for the CUDA-graph estimate
 export MAX_LOGPROBS="${MAX_LOGPROBS:-20}"  # 64 for tools/glm53/kld_glm.py
+# FP8 W8A16 (patch 13) for the BF16 linears: KDA q/k/v/o, lm_head, the MLA
+# projections the NoPE overlay dequantizes on load, and the whole DFlash2
+# drafter. KDA gates, kv_b_proj (MLA absorption), indexer and router stay
+# BF16. W8A16_RE= (empty) keeps everything BF16, as before 2026-10-20.
+W8A16_DEFAULT='^(?!.*visual).*(in_proj_qkvbfg_a|o_proj|lm_head|q_b_proj|fused_qkv_a_proj|qkv_proj|gate_up_proj|down_proj|fc|kernel_projection)'
+export W8A16_RE="${W8A16_RE-$W8A16_DEFAULT}"
+# Fixed KV pool (--kv-cache-memory) instead of the start-up memory profiling,
+# which on GB10 counts page cache as used and gave 75-126 blocks at random
+# from boot to boot. KV_MEM= (empty) goes back to profiling.
+# 12.8 GiB = 182 blocks with W8A16 (weights 92.7 GiB); with W8A16_RE= the
+# weights are 99.6 GiB and KV_MEM=8375186227 (7.8 GiB, 111 blocks) is the most
+# that leaves the host its margin. Measured with DFlash2 only (DFLASH=1).
+export KV_MEM="${KV_MEM-13743895347}"
 MEM_MIN="${MEM_MIN:-105.0}"             # GiB of MemFree required before starting
 
 export DFLASH="${DFLASH:-1}"
@@ -102,7 +116,7 @@ fi
 # sessions can restore a KDA state from the wrong position (gibberish turns).
 SCHED=scheduler$SUF
 [ "${PATCH_SCHED:-1}" = 1 ] || SCHED=scheduler.orig.py
-for f in "$CUBIT" moe_w2_delta$SUF llm_base_proposer$SUF v2_model_runner$SUF cuda_platform$SUF mamba_utils$SUF "$SCHED"; do
+for f in "$CUBIT" moe_w2_delta$SUF llm_base_proposer$SUF v2_model_runner$SUF cuda_platform$SUF mamba_utils$SUF "$SCHED" loader_utils$SUF glm53_w8a16.py; do
   [ -f "$PATCH_DIR/$f" ] || die "missing $PATCH_DIR/$f - run deploy/gb10-glm53/patches/build_mounts.sh"
 done
 export SWIGLU_MOUNT="$PATCH_DIR/$CUBIT"
@@ -112,6 +126,8 @@ export V2RUNNER_MOUNT="$PATCH_DIR/v2_model_runner$SUF"
 export CUDAPLAT_MOUNT="$PATCH_DIR/cuda_platform$SUF"
 export MAMBAUTILS_MOUNT="$PATCH_DIR/mamba_utils$SUF"
 export SCHED_MOUNT="$PATCH_DIR/$SCHED"
+export LOADER_MOUNT="$PATCH_DIR/loader_utils$SUF"
+export W8A16_MOUNT="$PATCH_DIR/glm53_w8a16.py"   # a new module: inert unless the loader hook imports it
 
 # The DFlash2 drafter's sliding-window layers have no fp8_ds_mla backend on
 # sm_121, so their KV must be skipped from quantization. The flag cannot live
@@ -124,8 +140,14 @@ if [ "$DFLASH" = 1 ]; then
   grep -q 'skip-layers=sliding_window' "$CF2" || die "could not insert --kv-cache-dtype-skip-layers"
   CF="$CF2"
 fi
+if [ -n "$KV_MEM" ]; then
+  CF3="$RUN_DIR/compose-kvmem.yml"
+  sed 's|^\(\s*\)- "--tensor-parallel-size=1"|\1- "--tensor-parallel-size=1"\n\1- "--kv-cache-memory='"$KV_MEM"'"|' "$CF" > "$CF3"
+  grep -q "kv-cache-memory=$KV_MEM" "$CF3" || die "could not insert --kv-cache-memory"
+  CF="$CF3"
+fi
 
-say "image $IMAGE, spec $SPEC_METHOD k=$MTP_K, planes $PLANES_DIR, pool ${DELTA_GB} GiB, context $MAX_LEN, util $UTIL"
+say "image $IMAGE, spec $SPEC_METHOD k=$MTP_K, planes $PLANES_DIR, pool ${DELTA_GB} GiB, context $MAX_LEN, util $UTIL, KV ${KV_MEM:-profiled}, W8A16 ${W8A16_RE:+on}"
 if [ "${DRY_RUN:-0}" = 1 ]; then
   docker compose -p "$PROJECT" -f "$CF" config
   exit 0

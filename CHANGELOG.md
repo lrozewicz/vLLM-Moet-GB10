@@ -14,6 +14,55 @@ temperature 0, mean of three code prompts).
 The what-and-why of each change against upstream is in
 [`docs/CHANGES-VS-UPSTREAM.md`](docs/CHANGES-VS-UPSTREAM.md).
 
+## Unreleased
+
+**GLM-5.3-Flash: ~43 tok/s on code (from ~29), prose 21.9 (from ~13).**
+Four mounted patches, each A/B-measured on the reference box against a
+fresh boot of the previous configuration; details and tables in
+[`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md) sections 6-9.
+HumanEval / HumanEval+ stay within the boot-to-boot spread throughout
+(149-156 / 141-147 of 164; the v0.3.0 configuration averages 155.8 / 147.0
+over later boots, so its 97.0% release figure was a good boot).
+
+### Added
+
+- **FP8 W8A16 for the BF16 linears** (patch 13, `glm53_w8a16.py`, knob
+  `W8A16_RE`). The KDA q/k/v/o, the lm_head, the MLA q_b/o projections and
+  the DFlash2 drafter are requantized after load to block-128 FP8 and run a
+  Triton W8A16 kernel in decode (BF16 activations, as fast as FP8 Marlin with
+  one copy of the weights); prefill dequantizes to BF16. Code 29-31 -> 38.9
+  tok/s, model 99.6 -> 92.7 GiB, KV 111 -> 182 blocks; KLD 0.02-0.03 vs
+  BF16, needles 48/48.
+- **MoE launch without the empty pairs, fused MoE glue** (patch 14,
+  `LOOP_GRID`, `FUSE_GLUE`, `kernels/cubins-sm120-loop`). Looped
+  grid-stride versions of the shipped expert GEMMs walk a compacted table
+  instead of launching a CTA per possible pair. Bit-exact; code 39.2 -> 42.2.
+- **Adaptive draft depth** (patch 15, `ADAPTIVE`): k in {3, 7} per step from
+  live acceptance. Prose 18.6 -> 21.3 tok/s, code unchanged; lossless
+  (verification decides the output).
+- **KDA verify without the per-token state stores** (patch 16,
+  `kda_commit.py`, `KDA_COMMIT`). The verify kernel logs the rank-1 updates
+  instead of storing a 4 MiB state per draft token; after sampling one
+  kernel replays the accepted tokens for all 34 layers and stores the state
+  the next step and the prefix cache read. Bit-exact; KDA state traffic
+  6.10 -> 2.24 ms per step, code 41.6 -> 43.0, prose 21.3 -> 21.9.
+
+### Fixed
+
+- **W8A16 shared-memory overflow at M > 16.** The kernel table is tuned at
+  M <= 16; at BM = 64 the drafter's down_proj entry (4096 x 12288, 6
+  stages) needed 102400 B of the 101376 on sm_121 and Triton raised
+  OutOfResources. The pipeline depth is now capped to the shared memory.
+  Production never reached that batch size; found while testing FP8-native
+  shared experts (no gain, not merged).
+
+### Measured and rejected (GLM-5.3-Flash)
+
+- FlashInfer W4A16 grouped GEMM for the experts: slower below ~40 active
+  experts (803 vs 254 us at decode size).
+- The checkpoint's own FP8 weights for the shared expert and dense MLP on the
+  W8A16 kernel: decode step unchanged (128.3 vs 128.1 ms).
+
 ## v0.3.0 - 2026-09-12
 
 **GLM-5.3-Flash on a single GB10.** A 321B-parameter model whose FP8

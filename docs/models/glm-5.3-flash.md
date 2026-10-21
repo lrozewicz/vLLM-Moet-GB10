@@ -25,7 +25,7 @@ per-token state stores, all three 2026-10-21):
 | two streams | 25.4 tok/s each, 46.6 together (code edits); two 96K prompts at once without preemption |
 | prefill | ~640 tok/s (643 on a 70K prompt, 632 on a 198K prompt) |
 | context | **200K** (204,800); a 198K-token prompt: 313 s to the first token, zero preemptions |
-| HumanEval pass@1 | **97.0%** (159/164) at `reasoning_effort` low; HumanEval+ **93.9%**. The original model on the z.ai API, same harness: 95.1% / 89.6% |
+| HumanEval pass@1 | **~95%** (154-156 of 164 over boots) at `reasoning_effort` low; HumanEval+ **~89.5%** (146-147). The FP4 pool's fill order changes the greedy text from boot to boot, ~+-3 tasks; the best single run (v0.3.0) was 97.0% / 93.9%. The original model on the z.ai API, same harness: 95.1% / 89.6% |
 | loop probe, long code | 0 of 16 samples degenerate |
 | memory | model 92.7 GiB, KV cache 12.8 GiB fixed (182 blocks, ~510K tokens) |
 | boot | first-time setup ~2 h (one-time quantization and builds), then 11-19 min per boot depending on the disk |
@@ -328,11 +328,14 @@ tests, and again with the much stricter HumanEval+ (EvalPlus) tests:
 | | HumanEval | HumanEval+ |
 |---|---:|---:|
 | original, z.ai API | 95.1% (156/164) | 89.6% (147/164) |
-| this setup (GPTQ-code planes) | **97.0%** (159/164) | **93.9%** (154/164) |
+| this setup (GPTQ-code planes), v0.3.0 run | **97.0%** (159/164) | **93.9%** (154/164) |
+| this setup with patches 13-16, typical boot | 94.5% (155/164) | 89.6% (147/164) |
 
-On HumanEval+ the original failed 10 tasks we passed, and we failed 3 that
-it passed. An exact McNemar test gives p = 0.09 (HumanEval: p = 0.45). The
-honest reading is **no measurable loss against the original on coding
+In the v0.3.0 run, on HumanEval+ the original failed 10 tasks we passed, and
+we failed 3 that it passed. An exact McNemar test gives p = 0.09 (HumanEval:
+p = 0.45). Later boots of the same configuration scored 154-156 / 146-147:
+that run was a good boot, not the typical one (the FP4 pool's fill order
+changes the greedy text, ~+-3 tasks). The honest reading is **no measurable loss against the original on coding
 tasks**, not that a 2-bit model beats it. How z.ai serves the model
 (precision, templates) is not published.
 
@@ -376,13 +379,13 @@ code prompts, 600 tokens, temperature 0, `reasoning_effort` low, warm server,
 
 | | |
 |---|---|
-| decode, code | ~42 tok/s, acceptance length 5.5 (first draft position accepted 92-94%, the seventh ~40%) |
+| decode, code | ~43 tok/s, acceptance length 5.5 (first draft position accepted 92-94%, the seventh ~40%) |
 | decode, code, `reasoning_effort` high | 24.6 tok/s at v0.3.0, not re-measured since (thinking is harder to draft) |
-| decode, prose | 17.6-18.5 tok/s (bench prompt); 15.0-15.8 on six long Polish texts |
+| decode, prose | 21.9 tok/s (bench prompt); 18.8 on six long Polish texts (adaptive k drops to 3 here) |
 | prefill | 643 tok/s at 70K, 632 tok/s at 198K (flat) |
 | one 198K-token prompt | TTFT 313 s, 86% of the KV pool, 0 preemptions |
 | two concurrent streams | two short ones (up to ~28K) fine; two long ones serialise |
-| KV cache | 6.2-7.5 GiB depending on the boot (200K needs 5.12 GiB) |
+| KV cache | 12.8 GiB fixed by `KV_MEM` (182 blocks, ~510K tokens; 200K needs 5.12 GiB) |
 
 ### Quality
 
@@ -393,7 +396,8 @@ HumanEval pass@1 (164 tasks, temperature 0, ~+-2 tasks of noise):
 | RTN planes, FP4 pool | 95.7% | 97.0% at `effort` high |
 | RTN planes, no pool | 92.1% | +26% decode |
 | GPTQ planes, calibrated on docs + Polish Wikipedia | 92.1% | Polish perplexity -3.7% |
-| **GPTQ planes, calibrated on code (production)** | **97.0%** | |
+| **GPTQ planes, calibrated on code (production)** | **97.0%** | single run; 95.0% (155.8) as the mean of 5 later boots |
+| production + patches 13-16 | 94.5% | 154-156 of 164 over boots, HumanEval+ 146-147 |
 
 Against the original model (z.ai API, same harness). HumanEval+ is the
 EvalPlus v0.1.10 test set, 120 s per task, with time-outs re-run at 600 s:
@@ -401,7 +405,8 @@ EvalPlus v0.1.10 test set, 120 s per task, with time-outs re-run at 600 s:
 | | HumanEval | HumanEval+ |
 |---|---:|---:|
 | original, z.ai API | 95.1% | 89.6% |
-| **GPTQ-code planes (production)** | **97.0%** | **93.9%** |
+| GPTQ-code planes, best run (v0.3.0) | 97.0% | 93.9% |
+| **production with patches 13-16, typical boot** | **94.5%** (155) | **89.6%** (147) |
 
 KLD harness, production (GPTQ-code) against the RTN planes. The noise floor
 is the same RTN configuration evaluated twice.
@@ -702,6 +707,9 @@ anything.
 | `MM_IMG` / `MM_VID` | 0 / 0 | images / videos per prompt |
 | `MAX_LOGPROBS` | 20 | 64 for the KLD harness |
 | `W8A16_RE` | KDA q/k/v/o, lm_head, MLA, drafter | module-name regex of the BF16 linears patch 13 runs in FP8; empty = all BF16 |
+| `LOOP_GRID` / `FUSE_GLUE` | `16,12` / 1 | patch 14: looped MoE launch over the live pairs (w2, w4 grid) and the fused glue; `LOOP_GRID= FUSE_GLUE=0` = the old launch |
+| `ADAPTIVE` | 1 | patch 15: draft depth k in {3, 7} per step from live acceptance; 0 = fixed `MTP_K` |
+| `KDA_COMMIT` | 1 | patch 16: KDA verify logs the updates, one kernel commits the accepted state; 0 = the stock kernel |
 | `KV_MEM` | 13743895347 (12.8 GiB) | fixed KV pool (`--kv-cache-memory`); empty = vLLM's profiling (75-126 blocks at random on GB10). With `W8A16_RE=` use 8375186227 |
 | `XDUMP` | 0 | 1 = mount the GPTQ capture hook |
 | `MEM_MIN` | 105.0 | GiB of `MemFree` required before starting |

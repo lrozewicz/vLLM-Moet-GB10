@@ -90,6 +90,7 @@ _CFG: dict[tuple[int, int], tuple[int, int, int, int]] = {
     (4096, 12288): (32, 8, 4, 6),    # drafter down_proj
     (4096, 20480): (32, 8, 2, 5),    # drafter fc
 }
+_SMEM_LIMIT = 101376  # bytes of shared memory per block on GB10 (sm_121)
 
 
 def w8a16_small_m(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor,
@@ -98,6 +99,10 @@ def w8a16_small_m(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor,
     n = q.shape[0]
     bn, split_k, warps, stages = cfg or _CFG.get((n, k), (32, 1, 4, 4))
     bm = 16 if m <= 16 else 32 if m <= 32 else 64
+    # The table is tuned at M <= 16; a deep pipeline does not fit the larger M
+    # tiles: Triton keeps (stages - 1) x (x tile + w tile) in shared memory, and
+    # e.g. (4096, 12288) at BM = 64 would need 102400 B of the 101376 on sm_121.
+    stages = min(stages, 1 + _SMEM_LIMIT // (bm * 128 * 2 + bn * 128))
     if split_k == 1:
         y = torch.empty((m, n), dtype=x.dtype, device=x.device)
     else:

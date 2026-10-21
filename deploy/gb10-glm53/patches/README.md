@@ -71,7 +71,7 @@ re-validate.
 | `models/glm5next/nvidia/kda.py` (`kda_layer.py`) | `2a20e453` | `9243d333` |
 | `v1/worker/gpu/model_states/mamba_hybrid.py` (`mamba_hybrid.py`) | `2057d739` | `7f1fb731` |
 | `kda_commit.py` (new, copied) | - | `d3adbbd0` |
-| `glm53_w8a16.py` (new, copied) | - | `3fcac2a6` |
+| `glm53_w8a16.py` (new, copied) | - | `459bd8b8` |
 
 (first 8 hex digits of md5; before patch 14 the patched `moe_w2_cubit.py` was
 `822cf242` and its xdump variant `db09d1e0`). `$PATCH_DIR/cubit` is the image's

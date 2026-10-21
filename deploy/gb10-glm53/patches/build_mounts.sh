@@ -23,7 +23,7 @@ IMAGE="${IMAGE:-vllm-moet-glm53:dflash2}"
 V=/usr/local/lib/python3.12/dist-packages/vllm
 
 # name in OUT -> path inside the vLLM package
-NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils scheduler loader_utils cudagraph_utils"
+NAMES="moe_w2_cubit moe_w2_delta llm_base_proposer v2_model_runner cuda_platform mamba_utils scheduler loader_utils cudagraph_utils kda_layer mamba_hybrid"
 src_of() {
   case "$1" in
     scheduler)         echo v1/core/sched/scheduler.py ;;
@@ -35,6 +35,8 @@ src_of() {
     mamba_utils)       echo model_executor/layers/mamba/mamba_utils.py ;;
     loader_utils)      echo model_executor/model_loader/utils.py ;;
     cudagraph_utils)   echo v1/worker/gpu/cudagraph_utils.py ;;
+    kda_layer)         echo models/glm5next/nvidia/kda.py ;;
+    mamba_hybrid)      echo v1/worker/gpu/model_states/mamba_hybrid.py ;;
   esac
 }
 
@@ -58,9 +60,10 @@ for f in "$LOOP_DIR"/*.cubin; do
 done
 echo "== cubit: $(ls "$OUT/cubit" | wc -l) cubins, looped: $(cd "$LOOP_DIR" && ls *.cubin | tr '\n' ' ')"
 
-apply() {  # apply <patch script> <target>
-  echo "-- $1 -> $(basename "$2")"
-  python3 "$HERE/$1" "$2"
+apply() {  # apply <patch script> [mode] <target>
+  local script=$1; shift
+  echo "-- $script -> $(basename "${@: -1}")"
+  python3 "$HERE/$script" "$@"
 }
 
 echo "== applying patches"
@@ -87,18 +90,25 @@ apply patch_mamba_align_block.py "$OUT/scheduler.py"
 apply patch_adaptive_k.py       "$OUT/scheduler.py"
 cp "$OUT/cudagraph_utils.orig.py" "$OUT/cudagraph_utils.py"
 apply patch_adaptive_graphs.py  "$OUT/cudagraph_utils.py"
+cp "$OUT/kda_layer.orig.py" "$OUT/kda_layer.py"
+apply patch_kda_commit.py layer "$OUT/kda_layer.py"
+cp "$OUT/mamba_hybrid.orig.py" "$OUT/mamba_hybrid.py"
+apply patch_kda_commit.py state "$OUT/mamba_hybrid.py"
 cp "$OUT/loader_utils.orig.py" "$OUT/loader_utils.py"
 apply patch_w8a16_loader.py     "$OUT/loader_utils.py"
 # Not a patch but a new module (patch 13 imports it): copied as is.
 cp "$HERE/glm53_w8a16.py" "$OUT/glm53_w8a16.py"
 python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$OUT/glm53_w8a16.py"
+# Patch 16: the KDA verify/commit module the two hooks above import.
+cp "$HERE/kda_commit.py" "$OUT/kda_commit.py"
+python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$OUT/kda_commit.py"
 # Optional variant for GPTQ calibration (boot.sh XDUMP=1): production file +
 # the MoE-input dump hook. Never mounted unless asked for.
 cp "$OUT/moe_w2_cubit.py" "$OUT/moe_w2_cubit.xdump.py"
 apply patch_xdump.py            "$OUT/moe_w2_cubit.xdump.py"
 
 echo "== result (md5, compare with patches/README.md)"
-for n in $NAMES moe_w2_cubit.xdump glm53_w8a16; do
+for n in $NAMES moe_w2_cubit.xdump glm53_w8a16 kda_commit; do
   f="$OUT/$n.py"
   [ "$n" = moe_w2_cubit.xdump ] && f="$OUT/moe_w2_cubit.xdump.py"
   printf '  %-24s %s\n' "$(basename "$f")" "$(md5sum < "$f" | cut -c1-8)"

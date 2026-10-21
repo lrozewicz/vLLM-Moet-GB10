@@ -15,12 +15,13 @@ step by step.
 
 Measured on the reference box (ASUS Ascent GX10, GB10, 121.6 GiB, aarch64),
 release v0.3.0 plus patches 13 (FP8 W8A16, 2026-10-20), 14 (MoE launch without
-empty pairs) and 15 (adaptive draft depth, both 2026-10-21):
+empty pairs), 15 (adaptive draft depth) and 16 (KDA verify without the
+per-token state stores, all three 2026-10-21):
 
 | | |
 |---|---|
-| decode, code | **~42 tok/s** (41.5-42.2 over three boots; patch 13 alone 38.9-39.2, v0.3.0 29-31) - DFlash2 k=7, acceptance length 5.5-5.6, temperature 0, `reasoning_effort` low |
-| decode, prose | **21.3 tok/s** (bench prompt; fixed k=7: 17.6-18.6, v0.3.0 12.4-13.5); 18.2 on six long Polish texts (k=7: 15.0-15.8) |
+| decode, code | **~43 tok/s** (43.0; patches 14-15 41.5-42.2 over three boots, patch 13 alone 38.9-39.2, v0.3.0 29-31) - DFlash2 k=7, acceptance length 5.5-5.6, temperature 0, `reasoning_effort` low |
+| decode, prose | **21.9 tok/s** (bench prompt; patch 15 21.3, fixed k=7: 17.6-18.6, v0.3.0 12.4-13.5); 18.2 on six long Polish texts (k=7: 15.0-15.8) |
 | two streams | 25.4 tok/s each, 46.6 together (code edits); two 96K prompts at once without preemption |
 | prefill | ~640 tok/s (643 on a 70K prompt, 632 on a 198K prompt) |
 | context | **200K** (204,800); a 198K-token prompt: 313 s to the first token, zero preemptions |
@@ -222,6 +223,39 @@ model's own; only how many drafted tokens get checked changes.
 noisy, and around code's acceptance k = 5 and 7 are within 5% of each other,
 so it kept stepping down. `ADAPTIVE=0` = fixed k.
 
+### 9. KDA verify without the per-token state stores (patch 16)
+
+The 34 KDA layers keep a recurrent state of 64 heads x 128 x 128 fp32 = 4 MiB
+per request. Verifying 8 drafted positions, the stock kernel wrote that state
+after every position, so the next step could start from whichever one the
+sampler accepted: 8 x 4 MiB x 34 layers, ~1 GB of writes per step, of which
+one state per layer survives. Measured in isolation (`tools/glm53/kda_state_bench.py`,
+`kda_commit_check.py`): 6.1 ms per step of a ~130 ms step.
+
+Patch 16 splits the work. The verify kernel stores only what each position
+adds to the state - the normalized key, exp(gate) and the beta-scaled delta,
+96 KiB instead of 4 MiB - and after sampling a single kernel for all KDA layers
+replays the accepted positions on the step's initial state and writes one
+state, into the slot the stock kernel would have filled for the accepted
+position (and, when the step crosses a mamba block, the boundary slot that the
+prefix-cache align copy reads). It runs before those copies, so everything
+that reads KDA state sees the same memory as before. The replay repeats the
+kernel's arithmetic, fused multiply-add included, so the state is bit-exact
+(checked over chained steps with random acceptance, including block
+boundaries); a different fma grouping already gives 1-ulp differences that
+flip later outputs, which is why the check compares bits.
+
+| | stock | patch 16 |
+|---|---:|---:|
+| KDA verify + commit, per step (isolated) | 6.10 ms | 2.24 ms |
+| step, code (k = 7) | 131.3 ms | 128.1 ms |
+| code, bench (tok/s) | 41.6 | **43.0** |
+| prose, bench (tok/s) | 21.3 | **21.9** |
+| HumanEval / HumanEval+, of 164 | 156 / 146 | 155 / 147 |
+
+Prose gains less because the adaptive controller verifies only 4 positions
+there. `KDA_COMMIT=0` = the stock kernel.
+
 ## Why the quality holds
 
 Short version: per token, only a small part of the computation runs through
@@ -335,7 +369,8 @@ code prompts, 600 tokens, temperature 0, `reasoning_effort` low, warm server,
 | GPTQ planes (code calibration), pool 2 GiB | 29.4 | HumanEval 97.0% |
 | FP8 W8A16 for the BF16 linears (patch 13) | 38.9 | HumanEval / HE+ in noise, KLD 0.02-0.03 |
 | MoE launch without empty pairs + glue fusion (patch 14) | 42.2 | bit-exact |
-| **adaptive draft depth (patch 15)** | **41.6 (prose 21.3)** | **lossless (verification)** |
+| adaptive draft depth (patch 15) | 41.6 (prose 21.3) | lossless (verification) |
+| **KDA verify without per-token state stores (patch 16)** | **43.0 (prose 21.9)** | **bit-exact** |
 
 ### Speed and context (current configuration)
 

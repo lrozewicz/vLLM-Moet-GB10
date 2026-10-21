@@ -152,6 +152,16 @@ if [ "${MOUNT_PATCHES:-1}" = 1 ]; then CUBIT_DIR=cubit; else CUBIT_DIR=cubit.ori
 export CUBIT_MOUNT="$PATCH_DIR/$CUBIT_DIR"
 export CGUTILS_MOUNT="$PATCH_DIR/cudagraph_utils$SUF"
 [ -f "$CGUTILS_MOUNT" ] || die "missing $CGUTILS_MOUNT - run deploy/gb10-glm53/patches/build_mounts.sh"
+# Patch 16: KDA spec verify without the per-token state stores (hooks in the
+# GLM5-Next KDA layer and the V2 mamba model state + the kda_commit module).
+# KDA_COMMIT=0 runs the stock kernel through the same files.
+export KDALAYER_MOUNT="$PATCH_DIR/kda_layer$SUF"
+export MAMBAHYB_MOUNT="$PATCH_DIR/mamba_hybrid$SUF"
+export KDACOMMIT_MOUNT="$PATCH_DIR/kda_commit.py"
+for f in "$KDALAYER_MOUNT" "$MAMBAHYB_MOUNT" "$KDACOMMIT_MOUNT"; do
+  [ -f "$f" ] || die "missing $f - run deploy/gb10-glm53/patches/build_mounts.sh"
+done
+export KDA_COMMIT="${KDA_COMMIT-1}"
 
 # The DFlash2 drafter's sliding-window layers have no fp8_ds_mla backend on
 # sm_121, so their KV must be skipped from quantization. The flag cannot live

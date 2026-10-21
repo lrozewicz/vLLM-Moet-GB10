@@ -30,6 +30,8 @@ docker run --rm --network host -e VLLM_API_KEY -v "$PWD":/w -w /w \
 | `desc_check.py` | Patch 14 desc build: the COMPACT tables hold exactly the live entries of the scattered ones, in order, with an empty tail. Takes the patched `moe_w2_cubit.py`. |
 | `glue_bench.py` | Patch 14 glue fusion: the fused gather+quant+seen and SwiGLU+quant kernels against the production ops (bit-exact) and their time. Takes the patched `moe_w2_cubit.py`. |
 | `step_sum.py` | Step time (decode seconds per draft), acceptance and tok/s per category from `bench_mtp.py` JSONs - the robust way to compare configurations, since acceptance moves +-3% between boots of the same one (the FP4 pool changes the greedy text). |
+| `kda_state_bench.py` | The ceiling of patch 16: the KDA spec-verify kernel with 8 per-token state stores vs one (and vs 16 tokens with one, the replay shape). Server stopped, serving image. |
+| `kda_commit_check.py` | Patch 16: `kda_commit` (rank-1 log + replay) against the stock kernel over chained steps with random acceptance - outputs, the committed slot and the block-boundary slot compared bit for bit, per replay fma form - then the time of both paths. Mount `kda_commit.py` into the image. |
 | `build_code_calib.py` | Builds the code calibration corpus for GPTQ from local clones of open-source repositories. |
 | `gptq_build.py` | Builds GPTQ planes (w13) from the MoE-input dumps of `patches/patch_xdump.py`. |
 

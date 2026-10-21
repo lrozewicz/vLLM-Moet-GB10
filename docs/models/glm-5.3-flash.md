@@ -384,7 +384,7 @@ code prompts, 600 tokens, temperature 0, `reasoning_effort` low, warm server,
 | decode, prose | 21.9 tok/s (bench prompt); 18.8 on six long Polish texts (adaptive k drops to 3 here) |
 | prefill | 643 tok/s at 70K, 632 tok/s at 198K (flat) |
 | one 198K-token prompt | TTFT 313 s, 86% of the KV pool, 0 preemptions |
-| two concurrent streams | two short ones (up to ~28K) fine; two long ones serialise |
+| two concurrent streams | two up to ~96K each at once, zero preemptions (182-block pool); longer pairs serialise |
 | KV cache | 12.8 GiB fixed by `KV_MEM` (182 blocks, ~510K tokens; 200K needs 5.12 GiB) |
 
 ### Quality
@@ -528,8 +528,9 @@ contact the authors.
 ./deploy/gb10-glm53/patches/build_mounts.sh      # -> ~/glm53-run/patch
 ```
 
-It copies six files out of the image, applies the patches, and prints md5
-sums; compare them with the table in
+It copies the eleven vLLM files the patches touch out of the image, applies
+the patches, adds the W8A16 and KDA-commit modules and assembles the cubin
+directory with the looped MoE kernels (patch 14), and prints md5 sums; compare them with the table in
 [`patches/README.md`](../../deploy/gb10-glm53/patches/README.md). `boot.sh`
 mounts the results read-only over the originals.
 
@@ -578,10 +579,11 @@ cache before writing anything. Any mismatch aborts without writing.
 
 The first boot with the FP4 tier also writes the 146 GB FP4 store to the
 NVMe, so it takes longer; later boots take 11-19 min. `boot.sh` ends by
-printing the KV numbers. 200K needs `Available KV cache memory` >= 5.12 GiB;
-if the boot fails with `max seq len ... larger than the maximum number of
-tokens that can be stored in KV cache`, use `MAX_LEN=180000` or a smaller
-`DELTA_GB`.
+printing the KV numbers: the pool is fixed by `KV_MEM` (12.8 GiB), so expect
+`num_gpu_blocks` 182 on every boot. If the boot fails with `max seq len ...
+larger than the maximum number of tokens that can be stored in KV cache`
+(e.g. with `W8A16_RE=`, which needs `KV_MEM=8375186227`), use
+`MAX_LEN=180000` or a smaller `DELTA_GB`.
 
 Smoke test:
 
@@ -594,7 +596,7 @@ curl -s http://localhost:8000/v1/chat/completions \
        "chat_template_kwargs":{"reasoning_effort":"low"}}'
 ```
 
-At this point you have the RTN configuration (HumanEval 95.7%).
+At this point you have the RTN configuration (HumanEval 95.7% when measured at v0.3.0).
 
 ### 8. GPTQ planes calibrated on code (recommended, ~1.5 h)
 
@@ -651,11 +653,12 @@ exists (`PLANES_DIR=planes-cache-fp4` goes back to RTN):
 ### 9. Check what you got
 
 ```bash
-python3 tools/glm53/bench_mtp.py --repeats 2 --warmup      # ~39 tok/s on the code prompts (~29 with W8A16_RE=)
+python3 tools/glm53/bench_mtp.py --repeats 2 --warmup      # ~43 tok/s on the code prompts (boot-to-boot ~+-4%)
 ```
 
 HumanEval (~40 min): see [`tools/glm53/humaneval/`](../../tools/glm53/humaneval/)
-- expect 96-97% at `effort` low. For comparing configurations properly, read
+- expect ~95% at `effort` low (149-156 of 164 over our boots since patch
+13; the FP4 pool's fill order moves it by ~+-3 tasks from boot to boot). For comparing configurations properly, read
 the rules in [`tools/glm53/README.md`](../../tools/glm53/README.md).
 
 ## Using the server
@@ -671,8 +674,9 @@ the rules in [`tools/glm53/README.md`](../../tools/glm53/README.md).
 - Sampling: `temperature` 1.0, `top_p` 0.95. `min_p` is rejected with
   speculative decoding (HTTP 400).
 - **Concurrency.** DFlash2 k=7 pins 32 KV pool blocks per request (one
-  recurrent-state copy per draft position in 4 KDA groups), so one long
-  stream fits and a second long one waits. For several long sessions at once,
+  recurrent-state copy per draft position in 4 KDA groups). With the fixed
+  182-block pool two streams of up to ~96K each run at once; a longer pair
+  serialises (the server runs at most 2 sequences). For more long sessions,
   boot the MTP variant (`DFLASH=0`, MTP k=4, about 2/3 of the speed). It
   needs layer 45 in the planes cache - run step 5 with `DFLASH=0`, and step 6
   with layers 3-45.

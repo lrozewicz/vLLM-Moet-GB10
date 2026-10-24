@@ -21,8 +21,8 @@ since, see section 9):
 
 | | |
 |---|---|
-| decode, code | **~40 tok/s** (38.7 / 39.9 in two runs on a 3-day-old production boot, 2026-10-24; with patch 16 43.0; patches 14-15 41.5-42.2 over three boots, patch 13 alone 38.9-39.2, v0.3.0 29-31) - DFlash2 k=7, acceptance length 5.2-5.6, temperature 0, `reasoning_effort` low |
-| decode, prose | **~20.5 tok/s** (bench prompt, 19.9 / 21.1 on 2026-10-24; with patch 16 21.9; patch 15 21.3, fixed k=7: 17.6-18.6, v0.3.0 12.4-13.5); 18.2 on six long Polish texts (k=7: 15.0-15.8) |
+| decode, code | **~42 tok/s** (41.5 / 42.3 on a fresh boot, 2026-10-25; 38.7 / 39.9 on a 3-day-old one; with patch 16 42.3-43.0; patches 14-15 41.5-42.2 over three boots, patch 13 alone 38.9-39.2, v0.3.0 29-31) - DFlash2 k=7, acceptance length 5.2-5.6, temperature 0, `reasoning_effort` low |
+| decode, prose | **~20.5 tok/s** (bench prompt, 20.2 / 20.7 on a fresh boot 2026-10-25; with patch 16 20.1-23.0; patch 15 21.3, fixed k=7: 17.6-18.6, v0.3.0 12.4-13.5); 18.2 on six long Polish texts (k=7: 15.0-15.8) |
 | two streams | 25.4 tok/s each, 46.6 together (code edits); two 96K prompts at once without preemption |
 | prefill | ~640 tok/s (643 on a 70K prompt, 632 on a 198K prompt) |
 | context | **200K** (204,800); a 198K-token prompt: 313 s to the first token, zero preemptions |
@@ -265,6 +265,18 @@ asynchronously, so the reporting call need not be the faulty kernel, and the
 cause is not isolated; the same configuration with `KDA_COMMIT=0` has run
 since without an error. `KDA_COMMIT=1` turns the patch back on.
 
+Re-measured A/B on fresh boots of the same configuration (2026-10-25,
+`bench_mtp.py --repeats 2 --warmup`, two runs each):
+
+| | `KDA_COMMIT=1` | `KDA_COMMIT=0` |
+|---|---:|---:|
+| code (tok/s) | 42.7 / 42.3 | 41.5 / 42.3 |
+| prose (tok/s) | 20.1 / 23.0 | 20.2 / 20.7 |
+
+The code gain is within the run-to-run noise, so leaving patch 16 off costs
+little. The same `KDA_COMMIT=0` boot measured 38.7 / 39.9 after three days
+of uptime: the server slows with age too.
+
 ## Why the quality holds
 
 Short version: per token, only a small part of the computation runs through
@@ -383,13 +395,13 @@ code prompts, 600 tokens, temperature 0, `reasoning_effort` low, warm server,
 | MoE launch without empty pairs + glue fusion (patch 14) | 42.2 | bit-exact |
 | adaptive draft depth (patch 15) | 41.6 (prose 21.3) | lossless (verification) |
 | KDA verify without per-token state stores (patch 16) | 43.0 (prose 21.9) | bit-exact; **off by default** after a production crash (section 9) |
-| **current default: patches 13-15, `KDA_COMMIT=0`** (production, 2026-10-24) | **38.7-39.9 (prose 19.9-21.1)** | |
+| **current default: patches 13-15, `KDA_COMMIT=0`** (fresh boot, 2026-10-25) | **41.5-42.3 (prose 20.2-20.7)** | |
 
 ### Speed and context (current configuration)
 
 | | |
 |---|---|
-| decode, code | ~40 tok/s (43 with patch 16), acceptance length 5.2-5.5 (first draft position accepted 92-94%, the seventh ~40%) |
+| decode, code | ~42 tok/s (patch 16 adds <1 tok/s, within noise), acceptance length 5.5-5.7 (first draft position accepted 92-94%, the seventh ~40%) |
 | decode, code, `reasoning_effort` high | 24.6 tok/s at v0.3.0, not re-measured since (thinking is harder to draft) |
 | decode, prose | ~20.5 tok/s (bench prompt; 21.9 with patch 16); 18.8 on six long Polish texts (adaptive k drops to 3 here) |
 | prefill | 643 tok/s at 70K, 632 tok/s at 198K (flat) |
@@ -663,7 +675,7 @@ exists (`PLANES_DIR=planes-cache-fp4` goes back to RTN):
 ### 9. Check what you got
 
 ```bash
-python3 tools/glm53/bench_mtp.py --repeats 2 --warmup      # ~40 tok/s on the code prompts (boot-to-boot ~+-4%)
+python3 tools/glm53/bench_mtp.py --repeats 2 --warmup      # ~42 tok/s on the code prompts (boot-to-boot ~+-4%)
 ```
 
 HumanEval (~40 min): see [`tools/glm53/humaneval/`](../../tools/glm53/humaneval/)

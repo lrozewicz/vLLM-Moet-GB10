@@ -16,9 +16,8 @@ The what-and-why of each change against upstream is in
 
 ## Unreleased
 
-**GLM-5.3-Flash: ~40 tok/s on code (from ~29), prose ~20.5 (from ~13).**
-(43.0 / 21.9 with patch 16, which is off by default after a crash in
-production; see below.) Four mounted patches, each A/B-measured on the reference box against a
+**GLM-5.3-Flash: ~42 tok/s on code (from ~29), prose ~20.5 (from ~13).**
+(Patch 16 is off by default after a crash in production; see below.) Four mounted patches, each A/B-measured on the reference box against a
 fresh boot of the previous configuration; details and tables in
 [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md) sections 6-9.
 HumanEval / HumanEval+ stay within the boot-to-boot spread throughout
@@ -49,7 +48,8 @@ over later boots, so its 97.0% release figure was a good boot).
   6.10 -> 2.24 ms per step, code 41.6 -> 43.0, prose 21.3 -> 21.9.
   **Off by default** (`KDA_COMMIT=0`): the first production boot with it
   died after ~8.5 h with a CUDA illegal memory access in the KDA chunk path;
-  cause not isolated.
+  cause not isolated. Re-measured on fresh boots (2026-10-25) it is within
+  noise: code 42.7 / 42.3 on vs 41.5 / 42.3 off.
 
 ### Fixed
 

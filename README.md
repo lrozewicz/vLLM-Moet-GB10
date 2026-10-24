@@ -12,7 +12,7 @@ supplies the speed, and a set of fixes covers what unified memory breaks.
 
 | model | size | decode, code | context | quality, measured | guide |
 |---|---|---:|---:|---|---|
-| **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** | 321B total / 18B active; FP8 checkpoint 306 GiB | **~43 tok/s** (DFlash2 + FP8 W8A16) | **200K** | HumanEval **~95%**, HumanEval+ **~89.5%** over boots, best run 97.0% / 93.9% (the original on z.ai: 95.1% / 89.6%) | [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md) |
+| **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** | 321B total / 18B active; FP8 checkpoint 306 GiB | **~40 tok/s** (DFlash2 + FP8 W8A16) | **200K** | HumanEval **~95%**, HumanEval+ **~89.5%** over boots, best run 97.0% / 93.9% (the original on z.ai: 95.1% / 89.6%) | [`docs/models/glm-5.3-flash.md`](docs/models/glm-5.3-flash.md) |
 | **[DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)** | 304B (284B + 20B DSpark head); ~156 GB | ~21 tok/s (DSpark k=2) | 256K | [`docs/quality.md`](docs/quality.md) | [`docs/models/deepseek-v4-flash-0731.md`](docs/models/deepseek-v4-flash-0731.md) |
 
 Each guide covers what had to change for that model, what was measured, why
